@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+logs/
+*.log
+.pytest_cache/
+.cache/
+.paddlenlp/
+
+resources/models/wordtag/*
+!resources/models/wordtag/README.md
+.uv-cache/

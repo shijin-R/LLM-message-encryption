@@ -1,0 +1,41 @@
+{
+  "llm_request": {
+    "model": "gpt-4o-mini",
+    "temperature": 0.2,
+    "messages": [
+      {
+        "role": "system",
+        "content": "你是合同助手"
+      },
+      {
+        "role": "user",
+        "content": "合同甲方：上海泛微网络科技股份有限公司，联系人张三，手机号13800138000。"
+      }
+    ]
+  },
+  "history_mappings": {
+    "PERSON": {
+      "张三": "[[PERSON_001]]"
+    }
+  },
+  "custom_entities": [
+    {
+      "entity_type": "PERSON",
+      "patterns": [
+        {
+          "regex": "联系人[：:\\s]*([\\u4e00-\\u9fff]{2,4})",
+          "group": 1
+        }
+      ]
+    },
+    {
+      "entity_type": "ORG",
+      "patterns": [
+        {
+          "regex": "甲方[：:\\s]*([^，。\\n]+)",
+          "group": 1
+        }
+      ]
+    }
+  ]
+}
