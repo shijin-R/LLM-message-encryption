@@ -38,31 +38,6 @@ def create_app() -> Flask:
             }
         )
 
-    @app.post("/v1/desensitize")
-    def desensitize():
-        # 主脱敏接口：直接处理 messages 并返回映射。
-        payload = request.get_json(silent=True)
-        if payload is None:
-            return (
-                jsonify(
-                    {
-                        "code": 400,
-                        "message": "Request body must be valid JSON.",
-                    }
-                ),
-                400,
-            )
-
-        try:
-            data = service.desensitize(payload)
-        except ValueError as exc:
-            return jsonify({"code": 400, "message": str(exc)}), 400
-        except Exception as exc:
-            app.logger.exception("Desensitize request failed: %s", exc)
-            return jsonify({"code": 500, "message": "Internal server error."}), 500
-
-        return jsonify({"code": 0, "message": "ok", "data": data})
-
     @app.post("/v1/llm/preprocess")
     def llm_preprocess():
         # 大模型前置拦截接口：返回可直接转发的上游请求体。

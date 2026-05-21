@@ -11,6 +11,13 @@ class EmptyRecognizer:
     def recognize_builtin(self, text: str) -> list[EntitySpan]:
         return []
 
+    def recognize_custom(
+        self,
+        text: str,
+        custom_entities: list[dict],
+    ) -> list[EntitySpan]:
+        return []
+
 
 class FakeRecognizer:
     def recognize_builtin(self, text: str) -> list[EntitySpan]:
@@ -27,6 +34,33 @@ class FakeRecognizer:
                 )
         return spans
 
+    def recognize_custom(
+        self,
+        text: str,
+        custom_entities: list[dict],
+    ) -> list[EntitySpan]:
+        if not isinstance(custom_entities, list):
+            return []
+
+        requested_types = {
+            str(rule.get("entity_type", "CUSTOM")).upper()
+            for rule in custom_entities
+            if isinstance(rule, dict)
+        }
+        spans: list[EntitySpan] = []
+        for entity_type, value in (
+            ("PERSON", "李四"),
+            ("ORG", "北京测试科技有限公司"),
+        ):
+            if entity_type not in requested_types:
+                continue
+            start = text.find(value)
+            if start >= 0:
+                spans.append(
+                    EntitySpan(entity_type, value, start, start + len(value), "custom")
+                )
+        return spans
+
 
 class DesensitizeServiceTest(unittest.TestCase):
     def setUp(self) -> None:
@@ -39,30 +73,54 @@ class DesensitizeServiceTest(unittest.TestCase):
         self.service = DesensitizeService(config)
         self.service.recognizer = FakeRecognizer()
 
-    def test_preprocess_returns_masked_request_and_reuses_history(self) -> None:
+    def preprocess(self, messages: list[dict], **extra_payload):
+        payload = {
+            "llm_request": {
+                "model": "demo",
+                "messages": messages,
+            }
+        }
+        payload.update(extra_payload)
+        return self.service.prepare_llm_request(payload)
+
+    def test_preprocess_returns_masked_request_and_reuses_message_mapping(self) -> None:
         payload = {
             "llm_request": {
                 "model": "demo",
                 "messages": [
                     {
                         "role": "user",
+                        "content": "上一轮联系人[[PERSON_009]]。",
+                        "encrypted": True,
+                        "mapping": {"PERSON": {"张三": "[[PERSON_009]]"}},
+                    },
+                    {"role": "assistant", "content": "已记录。"},
+                    {
+                        "role": "user",
                         "content": "合同甲方：上海泛微网络科技股份有限公司，联系人张三，手机号13800138000。",
+                        "encrypted": False,
                     }
                 ],
             },
-            "history_mappings": {"PERSON": {"张三": "[[PERSON_009]]"}},
         }
 
         result = self.service.prepare_llm_request(payload)
 
+        messages = result["desensitized_request"]["messages"]
+        self.assertNotIn("mapping", messages[0])
+        self.assertNotIn("encrypted", messages[0])
+        self.assertNotIn("encrypted", messages[2])
+        self.assertEqual(messages[0]["content"], "上一轮联系人[[PERSON_009]]。")
         self.assertEqual(
-            result["desensitized_request"]["messages"][0]["content"],
+            messages[2]["content"],
             "合同甲方：[[ORG_001]]，联系人[[PERSON_009]]，手机号[[MOBILE_001]]。",
         )
         self.assertEqual(result["mapping"]["PERSON"]["张三"], "[[PERSON_009]]")
+        self.assertEqual(result["stats"]["processed_message_indexes"], [2])
+        self.assertEqual(set(result), {"desensitized_request", "mapping", "stats"})
         self.assertNotIn("new_mapping", result)
 
-    def test_history_mapping_alias_is_supported(self) -> None:
+    def test_uses_message_mapping_and_strips_from_response(self) -> None:
         result = self.service.prepare_llm_request(
             {
                 "llm_request": {
@@ -70,158 +128,206 @@ class DesensitizeServiceTest(unittest.TestCase):
                     "messages": [
                         {
                             "role": "user",
-                            "content": "联系人张三，手机号13800138000。",
-                        }
+                            "content": "历史联系人[[PERSON_001]]。",
+                            "encrypted": True,
+                            "mapping": {
+                                "PERSON": {"张三": "[[PERSON_001]]"}
+                            },
+                        },
+                        {"role": "assistant", "content": "已记录。"},
+                        {
+                            "role": "user",
+                            "content": "这次还是张三，手机号13800138000。",
+                            "encrypted": False,
+                        },
                     ],
-                },
-                "history_mapping": {"PERSON": {"张三": "[[PERSON_007]]"}},
+                }
             }
+        )
+
+        messages = result["desensitized_request"]["messages"]
+        self.assertNotIn("mapping", messages[0])
+        self.assertNotIn("encrypted", messages[0])
+        self.assertNotIn("encrypted", messages[2])
+        self.assertEqual(messages[0]["content"], "历史联系人[[PERSON_001]]。")
+        self.assertEqual(
+            messages[2]["content"],
+            "这次还是[[PERSON_001]]，手机号[[MOBILE_001]]。",
+        )
+        self.assertEqual(result["mapping"]["PERSON"]["张三"], "[[PERSON_001]]")
+        self.assertEqual(result["stats"]["processed_message_indexes"], [2])
+
+    def test_unencrypted_message_mapping_is_not_used_as_history(self) -> None:
+        result = self.preprocess(
+            [
+                {
+                    "role": "user",
+                    "content": "联系人张三。",
+                    "encrypted": False,
+                    "mapping": {"PERSON": {"张三": "[[PERSON_009]]"}},
+                }
+            ]
+        )
+
+        message = result["desensitized_request"]["messages"][0]
+        self.assertNotIn("mapping", message)
+        self.assertNotIn("encrypted", message)
+        self.assertEqual(message["content"], "联系人[[PERSON_001]]。")
+        self.assertEqual(result["mapping"]["PERSON"]["张三"], "[[PERSON_001]]")
+
+    def test_all_unencrypted_user_messages_are_processed(self) -> None:
+        result = self.preprocess(
+            [
+                {"role": "user", "content": "第一轮联系人张三。"},
+                {"role": "assistant", "content": "已记录。"},
+                {
+                    "role": "user",
+                    "content": "第二轮还是张三，手机号13800138000。",
+                    "encrypted": False,
+                },
+            ]
+        )
+
+        messages = result["desensitized_request"]["messages"]
+        self.assertEqual(messages[0]["content"], "第一轮联系人[[PERSON_001]]。")
+        self.assertEqual(
+            messages[2]["content"],
+            "第二轮还是[[PERSON_001]]，手机号[[MOBILE_001]]。",
+        )
+        self.assertEqual(result["stats"]["processed_message_indexes"], [0, 2])
+
+    def test_encrypted_user_messages_are_skipped(self) -> None:
+        result = self.preprocess(
+            [
+                {
+                    "role": "user",
+                    "content": "历史联系人[[PERSON_001]]，手机号[[MOBILE_001]]。",
+                    "encrypted": True,
+                    "mapping": {
+                        "PERSON": {"张三": "[[PERSON_001]]"},
+                        "MOBILE": {"13800138000": "[[MOBILE_001]]"},
+                    },
+                }
+            ]
+        )
+
+        message = result["desensitized_request"]["messages"][0]
+        self.assertEqual(message["content"], "历史联系人[[PERSON_001]]，手机号[[MOBILE_001]]。")
+        self.assertNotIn("mapping", message)
+        self.assertNotIn("encrypted", message)
+        self.assertEqual(result["stats"]["processed_message_indexes"], [])
+
+    def test_desensitize_masks_without_custom_rules(self) -> None:
+        result = self.preprocess(
+            [
+                {
+                    "role": "user",
+                    "content": "手机号13800138000",
+                    "encrypted": False,
+                }
+            ]
         )
 
         self.assertEqual(
             result["desensitized_request"]["messages"][0]["content"],
-            "联系人[[PERSON_007]]，手机号[[MOBILE_001]]。",
-        )
-
-    def test_rejects_both_history_field_names(self) -> None:
-        with self.assertRaisesRegex(ValueError, "Use only one"):
-            self.service.prepare_llm_request(
-                {
-                    "llm_request": {
-                        "model": "demo",
-                        "messages": [{"role": "user", "content": "张三"}],
-                    },
-                    "history_mappings": {"PERSON": {"张三": "[[PERSON_001]]"}},
-                    "history_mapping": {"PERSON": {"张三": "[[PERSON_001]]"}},
-                }
-            )
-
-    def test_rejects_history_mappings_inside_message(self) -> None:
-        with self.assertRaisesRegex(ValueError, "top level"):
-            self.service.prepare_llm_request(
-                {
-                    "llm_request": {
-                        "model": "demo",
-                        "messages": [
-                            {
-                                "role": "user",
-                                "content": "张三",
-                                "history_mappings": {
-                                    "PERSON": {"张三": "[[PERSON_001]]"}
-                                },
-                            }
-                        ],
-                    }
-                }
-            )
-
-    def test_desensitize_masks_without_custom_rules(self) -> None:
-        result = self.service.desensitize(
-            {
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": "手机号13800138000",
-                    }
-                ]
-            }
-        )
-
-        self.assertEqual(
-            result["messages"][0]["content"],
             "手机号[[MOBILE_001]]",
         )
         self.assertEqual(result["mapping"]["MOBILE"]["13800138000"], "[[MOBILE_001]]")
 
-    def test_custom_pattern_group_masks_capture_only(self) -> None:
+    def test_all_unencrypted_user_content_is_processed(self) -> None:
+        result = self.preprocess(
+            [
+                {"role": "system", "content": "系统手机号13800138000"},
+                {"role": "user", "content": "历史用户手机号13800138000"},
+                {"role": "assistant", "content": "助手提到张三"},
+                {"role": "user", "content": "用户手机号13800138000", "encrypted": False},
+            ]
+        )
+
+        messages = result["desensitized_request"]["messages"]
+        self.assertEqual(messages[0]["content"], "系统手机号13800138000")
+        self.assertEqual(messages[1]["content"], "历史用户手机号[[MOBILE_001]]")
+        self.assertEqual(messages[2]["content"], "助手提到张三")
+        self.assertEqual(messages[3]["content"], "用户手机号[[MOBILE_001]]")
+        self.assertEqual(result["stats"]["processed_message_indexes"], [1, 3])
+
+    def test_custom_pattern_regex_is_not_used_without_model_result(self) -> None:
         self.service.recognizer = EmptyRecognizer()
 
-        result = self.service.desensitize(
-            {
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": "请联系联系人：李四确认合同。",
-                    }
-                ],
-                "custom_entities": [
-                    {
-                        "entity_type": "PERSON",
-                        "patterns": [
-                            {
-                                "regex": "联系人[：:\\s]*([\\u4e00-\\u9fff]{2})",
-                                "group": 1,
-                            }
-                        ],
-                    }
-                ],
-            }
+        result = self.preprocess(
+            [
+                {
+                    "role": "user",
+                    "content": "请联系联系人：李四确认合同。",
+                    "encrypted": False,
+                }
+            ],
+            custom_entities=[
+                {
+                    "entity_type": "PERSON",
+                    "patterns": [
+                        {
+                            "regex": "联系人[：:\\s]*([\\u4e00-\\u9fff]{2})",
+                            "group": 1,
+                        }
+                    ],
+                }
+            ],
         )
 
         self.assertEqual(
-            result["messages"][0]["content"],
+            result["desensitized_request"]["messages"][0]["content"],
+            "请联系联系人：李四确认合同。",
+        )
+        self.assertNotIn("PERSON", result["mapping"])
+
+    def test_custom_entity_masks_model_result(self) -> None:
+        result = self.preprocess(
+            [
+                {
+                    "role": "user",
+                    "content": "请联系联系人：李四确认合同。",
+                    "encrypted": False,
+                }
+            ],
+            custom_entities=[
+                {
+                    "entity_type": "PERSON",
+                    "model_labels": ["人名"],
+                }
+            ],
+        )
+
+        self.assertEqual(
+            result["desensitized_request"]["messages"][0]["content"],
             "请联系联系人：[[PERSON_001]]确认合同。",
         )
         self.assertEqual(result["mapping"]["PERSON"]["李四"], "[[PERSON_001]]")
 
-    def test_custom_value_masks_without_model_result(self) -> None:
+    def test_custom_value_is_not_string_matched_without_model_result(self) -> None:
         self.service.recognizer = EmptyRecognizer()
 
-        result = self.service.desensitize(
-            {
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": "请核对北京测试科技有限公司的合同。",
-                    }
-                ],
-                "custom_entities": [
-                    {
-                        "entity_type": "ORG",
-                        "values": ["北京测试科技有限公司"],
-                    }
-                ],
-            }
+        result = self.preprocess(
+            [
+                {
+                    "role": "user",
+                    "content": "请核对北京测试科技有限公司的合同。",
+                    "encrypted": False,
+                }
+            ],
+            custom_entities=[
+                {
+                    "entity_type": "ORG",
+                    "values": ["北京测试科技有限公司"],
+                }
+            ],
         )
 
         self.assertEqual(
-            result["messages"][0]["content"],
-            "请核对[[ORG_001]]的合同。",
+            result["desensitized_request"]["messages"][0]["content"],
+            "请核对北京测试科技有限公司的合同。",
         )
-        self.assertEqual(
-            result["mapping"]["ORG"]["北京测试科技有限公司"],
-            "[[ORG_001]]",
-        )
-
-    def test_target_message_indexes_only_process_selected_messages(self) -> None:
-        result = self.service.desensitize(
-            {
-                "messages": [
-                    {"role": "user", "content": "手机号13800138000"},
-                    {"role": "user", "content": "手机号13800138000"},
-                ],
-                "target_message_indexes": [1],
-            }
-        )
-
-        self.assertEqual(result["messages"][0]["content"], "手机号13800138000")
-        self.assertEqual(result["messages"][1]["content"], "手机号[[MOBILE_001]]")
-        self.assertEqual(result["stats"]["processed_message_indexes"], [1])
-
-    def test_desensitized_message_indexes_skip_selected_messages(self) -> None:
-        result = self.service.desensitize(
-            {
-                "messages": [
-                    {"role": "user", "content": "手机号13800138000"},
-                    {"role": "user", "content": "手机号13800138000"},
-                ],
-                "desensitized_message_indexes": [0],
-            }
-        )
-
-        self.assertEqual(result["messages"][0]["content"], "手机号13800138000")
-        self.assertEqual(result["messages"][1]["content"], "手机号[[MOBILE_001]]")
-        self.assertEqual(result["stats"]["processed_message_indexes"], [1])
+        self.assertNotIn("ORG", result["mapping"])
 
     def test_mobile_regex_does_not_match_inside_long_number(self) -> None:
         text = "订单号9913800138000123，手机号13800138000。"
@@ -232,6 +338,25 @@ class DesensitizeServiceTest(unittest.TestCase):
         ]
 
         self.assertEqual(matches, ["13800138000"])
+
+    def test_custom_person_model_result_filters_role_word(self) -> None:
+        recognizer = LocalEntityRecognizer.__new__(LocalEntityRecognizer)
+        recognizer.max_text_len = 10000
+        recognizer.strict_local_model = True
+        recognizer._taskflow = lambda text: [
+            ("联系人", "人名"),
+            ("张三", "人名"),
+        ]
+
+        spans = recognizer.recognize_custom(
+            "联系人张三",
+            [{"entity_type": "PERSON", "model_labels": ["人名"]}],
+        )
+
+        self.assertEqual(
+            [(span.entity_type, span.text, span.source) for span in spans],
+            [("PERSON", "张三", "custom")],
+        )
 
 
 if __name__ == "__main__":

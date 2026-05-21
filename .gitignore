@@ -1,13 +1,34 @@
+# Python cache / test output
 __pycache__/
 *.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local virtual environments and dependency caches
 .venv/
 venv/
-logs/
-*.log
-.pytest_cache/
+.uv-cache/
+
+# Local runtime caches and logs
 .cache/
 .paddlenlp/
+logs/
+*.log
+run_service.*.log
 
+# Local configuration
+.env
+.env.*
+
+# IDE metadata
+.idea/
+.vscode/
+
+# Large local model files. Keep only the directory note in git.
 resources/models/wordtag/*
+!resources/models/wordtag/
 !resources/models/wordtag/README.md
-.uv-cache/
+
+# Local demo / smoke-test script, not required in the maintained repo.
+run_and_test.ps1

@@ -11,10 +11,12 @@ import re
 import shutil
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import jieba
 from jieba import posseg
 
+from .mapping import normalize_entity_type
 from .types import EntitySpan
 
 
@@ -29,11 +31,17 @@ class LocalEntityRecognizer:
 
     MOBILE_PATTERN = re.compile(r"(?<!\d)1[3-9]\d{9}(?!\d)")
     CHINESE_PATTERN = re.compile(r"[\u4e00-\u9fff]")
+    CUSTOM_ENTITY_LABEL_ALIASES = {
+        "PERSON": {"person", "姓名", "人名", "人物", "姓氏"},
+        "ORG": {"org", "organization", "组织", "机构", "公司", "企业", "品牌"},
+        "MOBILE": {"mobile", "phone", "手机号", "手机号码", "电话"},
+    }
 
     PERSON_BAD_CASE = {
         "谢谢",
         "人名",
         "姓名",
+        "联系人",
         "今天上午",
         "今天下午",
     }
@@ -99,7 +107,7 @@ class LocalEntityRecognizer:
     def _build_taskflow(self):
         """按配置创建 Taskflow 推理实例，不可用时自动降级。"""
         if not self.enable_taskflow:
-            logger.warning("Taskflow wordtag is disabled; fallback to jieba+regex only")
+            logger.info("Taskflow wordtag is disabled; fallback to jieba+regex only")
             return None
 
         try:
@@ -237,6 +245,29 @@ class LocalEntityRecognizer:
         ]
         return self._deduplicate_spans(spans, text)
 
+    def recognize_custom(
+        self,
+        text: str,
+        custom_entities: list[Any],
+    ) -> list[EntitySpan]:
+        """使用本地 Taskflow 模型识别业务方声明的自定义实体。
+
+        这里不会执行业务方传入的 regex/pattern/value 字符串匹配；自定义实体只通过
+        本地模型返回的标签命中。`model_labels`、`labels` 或 `schema` 可用于声明要
+        匹配的模型标签；未提供时会根据 `entity_type` 使用内置别名兜底。
+        """
+        if not text or len(text) > self.max_text_len:
+            return []
+        if not isinstance(custom_entities, list):
+            return []
+
+        rules = self._normalize_custom_model_rules(custom_entities)
+        if not rules or self._taskflow is None:
+            return []
+
+        spans = self._extract_custom_with_taskflow(text, rules)
+        return self._deduplicate_spans(spans, text)
+
     def _extract_with_taskflow(self, text: str) -> list[EntitySpan]:
         """使用 Taskflow NER wordtag 抽取人名/机构。"""
         if self._taskflow is None:
@@ -335,6 +366,167 @@ class LocalEntityRecognizer:
         flush_active()
         return spans
 
+    def _extract_custom_with_taskflow(
+        self,
+        text: str,
+        rules: list[tuple[str, set[str]]],
+    ) -> list[EntitySpan]:
+        """按自定义标签规则从 Taskflow 输出中抽取实体。"""
+        try:
+            tagged = self._taskflow(text)
+        except Exception as exc:
+            if self.strict_local_model:
+                raise RuntimeError("Taskflow wordtag inference failed.") from exc
+            logger.warning("Taskflow inference failed, skip custom extraction: %s", exc)
+            return []
+
+        pairs = list(self._iter_taskflow_tokens(tagged))
+        if any(self._split_bioes_tag(tag)[0] for _, tag in pairs):
+            return self._extract_bioes_custom_taskflow_spans(text, pairs, rules)
+
+        spans: list[EntitySpan] = []
+        cursor = 0
+
+        for token, tag in pairs:
+            if not token:
+                continue
+
+            start = self._find_token(text, token, cursor)
+            if start < 0:
+                continue
+            end = start + len(token)
+            cursor = end
+
+            entity_type = self._match_custom_entity_type(tag, rules)
+            if (
+                entity_type
+                and self._looks_valid_entity(entity_type, token)
+                and end <= len(text)
+            ):
+                spans.append(EntitySpan(entity_type, token, start, end, "custom"))
+
+        return spans
+
+    def _extract_bioes_custom_taskflow_spans(
+        self,
+        text: str,
+        pairs: list[tuple[str, str]],
+        rules: list[tuple[str, set[str]]],
+    ) -> list[EntitySpan]:
+        """兼容 BIOES 标签序列的自定义实体抽取。"""
+        spans: list[EntitySpan] = []
+        cursor = 0
+        active_label = ""
+        active_start = -1
+        active_text = ""
+
+        def flush_active() -> None:
+            nonlocal active_label, active_start, active_text
+            entity_type = self._match_custom_entity_type(active_label, rules)
+            if (
+                entity_type
+                and active_start >= 0
+                and active_text
+                and self._looks_valid_entity(entity_type, active_text)
+            ):
+                end = active_start + len(active_text)
+                spans.append(EntitySpan(entity_type, active_text, active_start, end, "custom"))
+            active_label = ""
+            active_start = -1
+            active_text = ""
+
+        for token, raw_tag in pairs:
+            if not token:
+                continue
+
+            start = self._find_token(text, token, cursor)
+            if start < 0:
+                flush_active()
+                continue
+
+            end = start + len(token)
+            cursor = end
+            prefix, label = self._split_bioes_tag(raw_tag)
+
+            if not prefix or not label:
+                flush_active()
+                continue
+
+            if prefix == "S":
+                flush_active()
+                entity_type = self._match_custom_entity_type(label, rules)
+                if entity_type and self._looks_valid_entity(entity_type, token):
+                    spans.append(EntitySpan(entity_type, token, start, end, "custom"))
+            elif prefix == "B":
+                flush_active()
+                active_label = label
+                active_start = start
+                active_text = token
+            elif prefix in {"I", "E"} and active_label == label:
+                active_text += token
+                if prefix == "E":
+                    flush_active()
+            else:
+                flush_active()
+                if prefix == "B":
+                    active_label = label
+                    active_start = start
+                    active_text = token
+
+        flush_active()
+        return spans
+
+    def _normalize_custom_model_rules(
+        self,
+        custom_entities: list[Any],
+    ) -> list[tuple[str, set[str]]]:
+        """把 custom_entities 转成模型标签匹配规则。"""
+        rules: list[tuple[str, set[str]]] = []
+        for rule in custom_entities:
+            if not isinstance(rule, dict):
+                continue
+
+            raw_entity_type = rule.get("entity_type", rule.get("type", "CUSTOM"))
+            entity_type = normalize_entity_type(raw_entity_type)
+            labels = {
+                self._normalize_label(label)
+                for label in self._iter_label_values(
+                    rule.get("model_labels")
+                    or rule.get("labels")
+                    or rule.get("label")
+                    or rule.get("schema")
+                )
+            }
+            labels = {label for label in labels if label}
+            if not labels:
+                labels.add(self._normalize_label(raw_entity_type))
+
+            labels.update(self.CUSTOM_ENTITY_LABEL_ALIASES.get(entity_type, set()))
+            labels = {label for label in labels if label}
+            if labels:
+                rules.append((entity_type, labels))
+        return rules
+
+    @classmethod
+    def _match_custom_entity_type(
+        cls,
+        tag: str,
+        rules: list[tuple[str, set[str]]],
+    ) -> str:
+        normalized_tag = cls._normalize_label(tag)
+        if not normalized_tag:
+            return ""
+
+        for entity_type, labels in rules:
+            if any(
+                label == normalized_tag
+                or label in normalized_tag
+                or normalized_tag in label
+                for label in labels
+            ):
+                return entity_type
+        return ""
+
     def _append_model_span(
         self,
         spans: list[EntitySpan],
@@ -365,6 +557,45 @@ class LocalEntityRecognizer:
         if len(tag) > 2 and tag[1] == "-" and tag[0] in {"B", "I", "E", "S"}:
             return tag[0], tag[2:]
         return "", tag
+
+    @staticmethod
+    def _normalize_label(label: Any) -> str:
+        """标准化模型标签，便于中英文别名做包含匹配。"""
+        normalized = str(label or "").strip().lower()
+        return re.sub(r"\s+", "", normalized)
+
+    @staticmethod
+    def _ensure_list(value: Any) -> list[Any]:
+        if isinstance(value, list):
+            return value
+        if isinstance(value, tuple):
+            return list(value)
+        if value is None:
+            return []
+        if isinstance(value, dict):
+            label = (
+                value.get("name")
+                or value.get("label")
+                or value.get("type")
+                or value.get("entity_type")
+            )
+            return [label] if label is not None else []
+        return [value]
+
+    @classmethod
+    def _iter_label_values(cls, value: Any) -> Iterator[Any]:
+        for item in cls._ensure_list(value):
+            if isinstance(item, dict):
+                label = (
+                    item.get("name")
+                    or item.get("label")
+                    or item.get("type")
+                    or item.get("entity_type")
+                )
+                if label is not None:
+                    yield label
+                continue
+            yield item
 
     @staticmethod
     def _iter_taskflow_tokens(tagged) -> Iterator[tuple[str, str]]:
@@ -473,6 +704,23 @@ class LocalEntityRecognizer:
         if not re.search(r"[\u4e00-\u9fffA-Za-z]", text):
             return False
         return True
+
+    def _looks_valid_entity(self, entity_type: str, token: str) -> bool:
+        """按实体类型复用内置候选过滤，避免自定义模型规则放大噪声。"""
+        normalized_type = normalize_entity_type(entity_type)
+        if normalized_type == "PERSON":
+            return self._looks_valid_person(token)
+        if normalized_type == "ORG":
+            return self._looks_valid_org(token)
+        return self._looks_valid_custom(token)
+
+    @staticmethod
+    def _looks_valid_custom(token: str) -> bool:
+        """过滤空白和纯标点的自定义实体候选。"""
+        text = token.strip()
+        if not text:
+            return False
+        return bool(re.search(r"[\u4e00-\u9fffA-Za-z0-9]", text))
 
     @staticmethod
     def _deduplicate_spans(spans: list[EntitySpan], text: str) -> list[EntitySpan]:

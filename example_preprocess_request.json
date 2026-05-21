@@ -9,33 +9,39 @@
       },
       {
         "role": "user",
-        "content": "合同甲方：上海泛微网络科技股份有限公司，联系人张三，手机号13800138000。"
+        "content": "上一轮合同甲方：[[ORG_001]]，联系人[[PERSON_001]]，手机号[[MOBILE_001]]。",
+        "encrypted": true,
+        "mapping": {
+          "PERSON": {
+            "张三": "[[PERSON_001]]"
+          },
+          "ORG": {
+            "上海泛微网络科技股份有限公司": "[[ORG_001]]"
+          },
+          "MOBILE": {
+            "13800138000": "[[MOBILE_001]]"
+          }
+        }
+      },
+      {
+        "role": "assistant",
+        "content": "已记录。"
+      },
+      {
+        "role": "user",
+        "content": "本次合同甲方仍是上海泛微网络科技股份有限公司，联系人张三，手机号13800138000。",
+        "encrypted": false
       }
     ]
-  },
-  "history_mappings": {
-    "PERSON": {
-      "张三": "[[PERSON_001]]"
-    }
   },
   "custom_entities": [
     {
       "entity_type": "PERSON",
-      "patterns": [
-        {
-          "regex": "联系人[：:\\s]*([\\u4e00-\\u9fff]{2,4})",
-          "group": 1
-        }
-      ]
+      "model_labels": ["人名", "姓名"]
     },
     {
       "entity_type": "ORG",
-      "patterns": [
-        {
-          "regex": "甲方[：:\\s]*([^，。\\n]+)",
-          "group": 1
-        }
-      ]
+      "model_labels": ["机构", "公司", "组织"]
     }
   ]
 }

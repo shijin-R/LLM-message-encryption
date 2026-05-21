@@ -1,20 +1,18 @@
-import logging
-import re
 from typing import Any
 
 from .config import ServiceConfig
-from .mapping import MappingStore, is_placeholder_token, normalize_entity_type
+from .mapping import MappingStore, is_placeholder_token
 from .recognizer import LocalEntityRecognizer
 from .types import EntitySpan
 
 
-logger = logging.getLogger(__name__)
-
-
 class DesensitizeService:
+    MESSAGE_MAPPING_FIELD = "mapping"
+    MESSAGE_ENCRYPTED_FIELD = "encrypted"
+
     # 实体冲突消解时的来源优先级：值越大优先级越高。
     SPAN_PRIORITY = {
-        "history": 5,
+        "mapping": 5,
         "custom": 4,
         "model": 3,
         "regex": 3,
@@ -35,30 +33,13 @@ class DesensitizeService:
             downloaded_model_cache_path=config.downloaded_model_cache_path,
         )
 
-    def desensitize(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """对输入的 messages 执行脱敏并返回映射信息。"""
-        if not isinstance(payload, dict):
-            raise ValueError("Request body must be a JSON object.")
-
-        normalized_payload = self._normalize_payload(payload)
-        raw_messages = normalized_payload["messages"]
-        self._validate_no_message_history_mappings(raw_messages)
-
-        # 读取上下文：顶层历史映射 + 自定义规则 + 内置识别。
-        mapping_store = MappingStore(self._get_history_mappings(normalized_payload))
-        custom_entities = self._normalize_custom_entities(
-            normalized_payload.get("custom_entities")
-        )
-
-        # 控制哪些消息需要处理，避免重复脱敏。
-        desensitized_indexes = self._to_index_set(
-            normalized_payload.get("desensitized_message_indexes", [])
-        )
-        target_indexes = None
-        if "target_message_indexes" in normalized_payload:
-            target_indexes = self._to_index_set(
-                normalized_payload.get("target_message_indexes", [])
-            )
+    def _desensitize_messages(
+        self,
+        raw_messages: list[Any],
+        custom_entities: list[Any],
+    ) -> dict[str, Any]:
+        """对预处理请求中的 messages 执行内部脱敏并返回映射信息。"""
+        mapping_store = MappingStore(self._collect_message_mappings(raw_messages))
 
         output_messages: list[Any] = []
         processed_indexes: list[int] = []
@@ -69,10 +50,7 @@ class DesensitizeService:
             content = normalized_message["content"]
 
             should_process = self._should_process_message(
-                index=index,
                 message=normalized_message,
-                desensitized_indexes=desensitized_indexes,
-                target_indexes=target_indexes,
             )
 
             if should_process and content:
@@ -82,9 +60,10 @@ class DesensitizeService:
                     custom_entities=custom_entities,
                 )
                 normalized_message["content"] = masked_content
-                normalized_message["desensitized"] = True
                 processed_indexes.append(index)
                 total_replacements += replacement_count
+
+            self._strip_internal_message_fields(normalized_message)
 
             # 兼容输入可能是字符串列表或对象列表两种形式。
             output_messages.append(
@@ -114,59 +93,27 @@ class DesensitizeService:
         raw_messages = llm_request.get("messages")
         if not isinstance(raw_messages, list):
             raise ValueError("`llm_request.messages` must be a list.")
-        self._validate_no_message_history_mappings(raw_messages)
 
-        history_mappings = self._get_history_mappings(payload)
         custom_entities = self._normalize_custom_entities(payload.get("custom_entities"))
 
-        upstream_request = dict(llm_request)
+        desensitized = self._desensitize_messages(raw_messages, custom_entities)
 
-        desensitize_payload: dict[str, Any] = {
-            "messages": raw_messages,
-            "history_mappings": history_mappings,
-            "custom_entities": custom_entities,
-            "desensitized_message_indexes": payload.get("desensitized_message_indexes", []),
-        }
-        if "target_message_indexes" in payload:
-            desensitize_payload["target_message_indexes"] = payload.get(
-                "target_message_indexes", []
-            )
-
-        desensitized = self.desensitize(desensitize_payload)
-
-        upstream_request["messages"] = desensitized["messages"]
+        desensitized_request = dict(llm_request)
+        desensitized_request["messages"] = desensitized["messages"]
 
         return {
-            "desensitized_request": upstream_request,
-            "upstream_request": upstream_request,
+            "desensitized_request": desensitized_request,
             "mapping": desensitized["mapping"],
             "stats": desensitized["stats"],
         }
 
     @staticmethod
-    def _normalize_payload(payload: dict[str, Any]) -> dict[str, Any]:
-        """校验并标准化主脱敏接口入参。"""
-        messages = payload.get("messages")
-        if not isinstance(messages, list):
-            raise ValueError("`messages` must be a list.")
-        return payload
-
-    @staticmethod
     def _get_llm_request(payload: dict[str, Any]) -> dict[str, Any]:
-        """兼容不同字段名，取出原始大模型请求体。"""
-        for field_name in ("llm_request", "model_request", "request"):
-            llm_request = payload.get(field_name)
-            if llm_request is not None:
-                if not isinstance(llm_request, dict):
-                    raise ValueError(
-                        "`llm_request` (or `model_request` / `request`) "
-                        "must be a JSON object."
-                    )
-                return llm_request
-
-        raise ValueError(
-            "`llm_request` (or `model_request` / `request`) must be a JSON object."
-        )
+        """取出原始大模型请求体。"""
+        llm_request = payload.get("llm_request")
+        if not isinstance(llm_request, dict):
+            raise ValueError("`llm_request` must be a JSON object.")
+        return llm_request
 
     @staticmethod
     def _build_stats(
@@ -184,31 +131,40 @@ class DesensitizeService:
             "new_entities": sum(len(item_map) for item_map in new_mapping.values()),
         }
 
-    @staticmethod
-    def _get_history_mappings(payload: dict[str, Any]) -> Any:
-        """读取顶层历史映射；`history_mapping` 仅作为兼容别名。"""
-        has_primary = "history_mappings" in payload
-        has_alias = "history_mapping" in payload
-        if has_primary and has_alias:
-            raise ValueError(
-                "Use only one of `history_mappings` or `history_mapping`; "
-                "`history_mappings` is recommended."
-            )
-        if has_primary:
-            return payload.get("history_mappings")
-        return payload.get("history_mapping")
+    @classmethod
+    def _get_message_mapping(cls, message: dict[str, Any]) -> Any:
+        """读取单条 user message 内携带的历史映射。"""
+        return message.get(cls.MESSAGE_MAPPING_FIELD)
 
-    @staticmethod
-    def _validate_no_message_history_mappings(raw_messages: list[Any]) -> None:
-        """历史映射只能放在请求顶层，不能混入 message。"""
-        for index, raw_message in enumerate(raw_messages):
+    @classmethod
+    def _collect_message_mappings(
+        cls,
+        raw_messages: list[Any],
+    ) -> dict[str, dict[str, str]]:
+        """合并已脱敏 user message 内的映射，供本次请求复用占位符。"""
+        combined: dict[str, dict[str, str]] = {}
+        for raw_message in raw_messages:
             if not isinstance(raw_message, dict):
                 continue
-            if "history_mappings" in raw_message or "history_mapping" in raw_message:
-                raise ValueError(
-                    "`history_mappings` must be provided at the top level, "
-                    f"not inside `messages[{index}]`."
-                )
+            if not cls._is_user_message(raw_message):
+                continue
+            if not cls._is_message_encrypted(raw_message):
+                continue
+            cls._merge_mappings(combined, cls._get_message_mapping(raw_message))
+
+        return combined
+
+    @staticmethod
+    def _merge_mappings(
+        target: dict[str, dict[str, str]],
+        mapping: Any,
+    ) -> None:
+        """把一份映射归一化后合入目标字典；已有项保持优先。"""
+        normalized = MappingStore(mapping).as_dict()
+        for entity_type, item_map in normalized.items():
+            target_map = target.setdefault(entity_type, {})
+            for source_text, placeholder in item_map.items():
+                target_map.setdefault(source_text, placeholder)
 
     def _mask_single_text(
         self,
@@ -217,15 +173,15 @@ class DesensitizeService:
         custom_entities: list[Any],
     ) -> tuple[str, int]:
         """对单条文本执行实体抽取、冲突消解和占位符替换。"""
-        # 三路实体来源：历史映射、自定义规则、内置识别。
-        # 历史映射用于保证占位符复用；内置识别里 Taskflow wordtag 是主识别链路。
-        history_spans = self._extract_history_spans(text, mapping_store.mapping)
-        custom_spans = self._extract_custom_spans(text, custom_entities)
+        # 三路实体来源：已有映射、自定义模型规则、内置识别。
+        # 已有映射用于保证占位符复用；内置识别里 Taskflow wordtag 是主识别链路。
+        mapping_spans = self._extract_mapping_spans(text, mapping_store.mapping)
+        custom_spans = self.recognizer.recognize_custom(text, custom_entities)
         builtin_spans = self.recognizer.recognize_builtin(text)
 
         selected_spans = self._resolve_overlaps(
             text,
-            history_spans + custom_spans + builtin_spans,
+            mapping_spans + custom_spans + builtin_spans,
         )
 
         if not selected_spans:
@@ -246,15 +202,15 @@ class DesensitizeService:
 
         return masked_text, replacement_count
 
-    def _extract_history_spans(
+    def _extract_mapping_spans(
         self,
         text: str,
-        history_mapping: dict[str, dict[str, str]],
+        known_mapping: dict[str, dict[str, str]],
     ) -> list[EntitySpan]:
-        """从历史映射中回查当前文本命中的实体。"""
+        """从已有映射中回查当前文本命中的实体。"""
         spans: list[EntitySpan] = []
 
-        for entity_type, item_map in history_mapping.items():
+        for entity_type, item_map in known_mapping.items():
             for source_text in item_map.keys():
                 if not isinstance(source_text, str):
                     continue
@@ -269,87 +225,7 @@ class DesensitizeService:
                             text=candidate,
                             start=start,
                             end=end,
-                            source="history",
-                        )
-                    )
-
-        return spans
-
-    def _extract_custom_spans(
-        self,
-        text: str,
-        custom_entities: list[Any],
-    ) -> list[EntitySpan]:
-        """按业务方传入的 values/patterns 提取自定义实体。"""
-        if not isinstance(custom_entities, list):
-            return []
-
-        spans: list[EntitySpan] = []
-
-        for rule in custom_entities:
-            if not isinstance(rule, dict):
-                continue
-
-            entity_type = normalize_entity_type(rule.get("entity_type", "CUSTOM"))
-
-            for raw_value in self._ensure_list(rule.get("values", [])):
-                if not isinstance(raw_value, str):
-                    continue
-                value = raw_value.strip()
-                if not value:
-                    continue
-                for start, end in self._find_all_occurrences(text, value):
-                    spans.append(
-                        EntitySpan(
-                            entity_type=entity_type,
-                            text=value,
-                            start=start,
-                            end=end,
-                            source="custom",
-                        )
-                    )
-
-            for raw_pattern in self._ensure_list(rule.get("patterns", [])):
-                pattern, group = self._parse_pattern(raw_pattern)
-                if not pattern:
-                    continue
-
-                try:
-                    matches = re.finditer(pattern, text)
-                except re.error as exc:
-                    logger.warning("Invalid custom regex `%s`: %s", pattern, exc)
-                    continue
-
-                for match in matches:
-                    try:
-                        start, end = match.span(group)
-                        matched_text = match.group(group)
-                    except IndexError:
-                        continue
-
-                    if matched_text is None:
-                        continue
-
-                    # 去除分组捕获中的首尾空白，保证替换边界准确。
-                    left_trim = len(matched_text) - len(matched_text.lstrip())
-                    right_trim = len(matched_text) - len(matched_text.rstrip())
-                    start += left_trim
-                    end -= right_trim
-
-                    if start >= end:
-                        continue
-
-                    candidate = text[start:end]
-                    if not candidate.strip() or is_placeholder_token(candidate.strip()):
-                        continue
-
-                    spans.append(
-                        EntitySpan(
-                            entity_type=entity_type,
-                            text=candidate,
-                            start=start,
-                            end=end,
-                            source="custom",
+                            source="mapping",
                         )
                     )
 
@@ -384,7 +260,7 @@ class DesensitizeService:
         if not valid_spans:
             return []
 
-        # 历史映射优先，避免复用关系被更长的模型候选覆盖；同优先级取更长跨度。
+        # 已有映射优先，避免复用关系被更长的模型候选覆盖；同优先级取更长跨度。
         ranked_spans = sorted(
             valid_spans,
             key=lambda item: (
@@ -422,31 +298,6 @@ class DesensitizeService:
         return positions
 
     @staticmethod
-    def _parse_pattern(raw_pattern: Any) -> tuple[str, int]:
-        """兼容自定义正则的字符串/对象两种格式。"""
-        if isinstance(raw_pattern, str):
-            return raw_pattern, 0
-        if isinstance(raw_pattern, dict):
-            pattern = raw_pattern.get("regex") or raw_pattern.get("pattern")
-            if not isinstance(pattern, str):
-                return "", 0
-            group = raw_pattern.get("group", 0)
-            try:
-                return pattern, int(group)
-            except (TypeError, ValueError):
-                return pattern, 0
-        return "", 0
-
-    @staticmethod
-    def _ensure_list(value: Any) -> list[Any]:
-        """把单值/空值统一成列表，简化后续遍历。"""
-        if isinstance(value, list):
-            return value
-        if value is None:
-            return []
-        return [value]
-
-    @staticmethod
     def _normalize_custom_entities(value: Any) -> list[Any]:
         """清洗自定义实体规则，避免非列表入参干扰识别流程。"""
         if not isinstance(value, list):
@@ -457,7 +308,7 @@ class DesensitizeService:
     def _normalize_message(raw_message: Any) -> tuple[dict[str, Any], bool]:
         """兼容字符串消息与对象消息，统一为内部结构。"""
         if isinstance(raw_message, str):
-            return {"role": "user", "content": raw_message, "desensitized": False}, True
+            return {"role": "user", "content": raw_message}, True
 
         if isinstance(raw_message, dict):
             message = dict(raw_message)
@@ -472,31 +323,28 @@ class DesensitizeService:
         raise ValueError("Each message must be either a string or an object.")
 
     @staticmethod
-    def _to_index_set(raw_indexes: Any) -> set[int]:
-        """把索引数组清洗成非负整数集合。"""
-        if not isinstance(raw_indexes, list):
-            return set()
+    def _is_user_message(message: dict[str, Any]) -> bool:
+        """判断是否是需要脱敏服务关注的 user 消息。"""
+        role = message.get("role", "user")
+        return isinstance(role, str) and role.lower() == "user"
 
-        indexes: set[int] = set()
-        for item in raw_indexes:
-            try:
-                index = int(item)
-            except (TypeError, ValueError):
-                continue
-            if index >= 0:
-                indexes.add(index)
-        return indexes
+    @classmethod
+    def _is_message_encrypted(cls, message: dict[str, Any]) -> bool:
+        """判断业务方标记的 user message 是否已经完成脱敏处理。"""
+        return message.get(cls.MESSAGE_ENCRYPTED_FIELD) is True
 
-    @staticmethod
+    @classmethod
+    def _strip_internal_message_fields(cls, message: dict[str, Any]) -> None:
+        """返回给上游模型前移除脱敏服务内部控制字段。"""
+        message.pop(cls.MESSAGE_MAPPING_FIELD, None)
+        message.pop(cls.MESSAGE_ENCRYPTED_FIELD, None)
+
+    @classmethod
     def _should_process_message(
-        index: int,
+        cls,
         message: dict[str, Any],
-        desensitized_indexes: set[int],
-        target_indexes: set[int] | None,
     ) -> bool:
         """判断当前消息是否需要本次脱敏处理。"""
-        if target_indexes is not None and index not in target_indexes:
+        if not cls._is_user_message(message):
             return False
-        if index in desensitized_indexes:
-            return False
-        return not bool(message.get("desensitized", False))
+        return not cls._is_message_encrypted(message)

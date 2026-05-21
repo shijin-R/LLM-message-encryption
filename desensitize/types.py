@@ -10,7 +10,7 @@ class EntitySpan:
     entity_type: 实体类型（如 PERSON/ORG/MOBILE）
     text: 实体原文
     start/end: 在原文中的字符区间（左闭右开）
-    source: 命中来源（history/custom/model/jieba/regex）
+    source: 命中来源（mapping/custom/model/jieba/regex）
     """
 
     entity_type: str

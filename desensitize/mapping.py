@@ -1,6 +1,6 @@
 """映射字典管理模块。
 
-负责历史映射归一化、占位符分配与增量映射输出。
+负责映射归一化、占位符分配与增量映射输出。
 """
 
 import re
@@ -26,9 +26,9 @@ def is_placeholder_token(value: str) -> bool:
 class MappingStore:
     """维护完整映射与本次新增映射。"""
 
-    def __init__(self, history_mappings: Any = None) -> None:
+    def __init__(self, initial_mapping: Any = None) -> None:
         # mapping: {ENTITY_TYPE: {原文: 占位符}}
-        self.mapping = self._normalize_history(history_mappings)
+        self.mapping = self._normalize_mapping(initial_mapping)
         # new_mapping: 本次请求中新建的映射项。
         self.new_mapping: dict[str, dict[str, str]] = {
             entity_type: {} for entity_type in self.mapping
@@ -36,13 +36,13 @@ class MappingStore:
         # 每种实体类型的下一个编号游标。
         self._next_index = self._build_next_index()
 
-    def _normalize_history(self, history_mappings: Any) -> dict[str, dict[str, str]]:
-        """把历史映射统一转换为标准字典结构。"""
+    def _normalize_mapping(self, mapping: Any) -> dict[str, dict[str, str]]:
+        """把映射输入统一转换为标准字典结构。"""
         normalized: dict[str, dict[str, str]] = {}
-        if not isinstance(history_mappings, dict):
+        if not isinstance(mapping, dict):
             return normalized
 
-        for raw_entity_type, raw_mapping in history_mappings.items():
+        for raw_entity_type, raw_mapping in mapping.items():
             entity_type = normalize_entity_type(raw_entity_type)
             normalized.setdefault(entity_type, {})
 
