@@ -7,7 +7,7 @@
 - 处理 `llm_request.messages` 中未标记为已脱敏的 `user` 消息。
 - 将姓名、组织/公司、手机号替换为结构化占位符，例如 `[[PERSON_001]]`、`[[ORG_001]]`、`[[MOBILE_001]]`。
 - 返回完整 `mapping`，由调用方自行保存并在后续请求中带回，以复用同一套占位符。
-- 默认使用本地 PaddleNLP `Taskflow("ner", entity_only=True)` 的 wordtag/accurate 模型；手机号使用正则补充识别。
+- 默认使用 PaddleNLP `Taskflow("ner", entity_only=True)` 的 wordtag/accurate 模型识别姓名和组织；手机号使用正则补充识别。
 
 本服务不保存会话状态，不持久化映射字典，不转发大模型请求，也不提供大模型响应还原接口。
 
@@ -21,20 +21,44 @@ python -m pip install -r requirements.txt
 
 依赖版本中 `paddlenlp==2.8.1` 需要 `aistudio-sdk==0.2.6`，不要随意升级该包。
 
-## 模型文件
+## 准备模型
 
-默认模型目录：
+服务默认从下面目录加载 wordtag 模型：
 
 ```text
 resources/models/wordtag
 ```
 
-模型文件体积较大，不建议提交到代码仓库。部署环境应通过内网制品库、共享目录或部署脚本准备模型文件。目录中至少需要包含 PaddleNLP wordtag 推理所需文件，例如：
+推荐让服务首次启动时自动下载并同步模型：
 
-- `model_state.pdparams`
-- `config.json`
-- `vocab.txt`
-- `static/`
+```powershell
+$env:DESENSITIZE_AUTO_DOWNLOAD_MODEL="true"
+$env:DESENSITIZE_SYNC_DOWNLOADED_MODEL="true"
+python app.py
+```
+
+首次启动会通过 PaddleNLP 下载默认 wordtag 模型。下载完成后，服务会把模型同步到 `resources/models/wordtag`，后续启动会优先读取该目录。
+
+如果运行环境无法直接访问外网，可以先在一台能访问模型源的机器上执行：
+
+```powershell
+python -c "from paddlenlp import Taskflow; Taskflow('ner', entity_only=True)"
+```
+
+下载完成后，将用户目录下的 PaddleNLP 缓存复制到项目模型目录：
+
+```powershell
+New-Item -ItemType Directory -Force .\resources\models\wordtag
+Copy-Item "$env:USERPROFILE\.paddlenlp\taskflow\wordtag\*" .\resources\models\wordtag -Recurse -Force
+```
+
+模型目录准备好后，可用下面命令检查：
+
+```powershell
+Get-ChildItem .\resources\models\wordtag
+```
+
+常见文件包括 `model_state.pdparams`、`config.json`、`vocab.txt` 和 `static` 推理文件。
 
 相关环境变量：
 
@@ -64,6 +88,18 @@ http://127.0.0.1:18001
 ```powershell
 Invoke-RestMethod "http://127.0.0.1:18001/healthz" | ConvertTo-Json -Depth 10
 ```
+
+重点关注：
+
+```json
+{
+  "status": "ok",
+  "using_taskflow": true,
+  "model_path": "resources/models/wordtag"
+}
+```
+
+`using_taskflow=true` 表示本地模型已经成功初始化。
 
 ## 接口
 
@@ -95,7 +131,21 @@ POST /v1/llm/preprocess
 - `messages[].mapping`：历史已脱敏 user 消息携带的映射字典，用于复用占位符。
 - `custom_entities`：可选，声明需要本地模型额外关注的实体标签。
 
-返回结果中的 `data.desensitized_request` 可继续发送给上游大模型，`data.mapping` 应由调用方保存，供下一轮对话复用。
+成功响应格式：
+
+```json
+{
+  "code": 0,
+  "message": "ok",
+  "data": {
+    "desensitized_request": {},
+    "mapping": {},
+    "stats": {}
+  }
+}
+```
+
+调用方应使用 `data.desensitized_request` 继续请求上游大模型，并保存 `data.mapping` 供下一轮对话复用。
 
 ## 示例请求
 
@@ -138,20 +188,6 @@ Invoke-RestMethod `
 ```
 
 业务方实际接入时，建议每次请求后保存接口返回的 `data.mapping`；下一轮请求中，把该映射放到对应的历史 user message 的 `mapping` 字段，并将该历史消息标记为 `encrypted=true`。
-
-成功响应格式：
-
-```json
-{
-  "code": 0,
-  "message": "ok",
-  "data": {
-    "desensitized_request": {},
-    "mapping": {},
-    "stats": {}
-  }
-}
-```
 
 ## 测试
 
