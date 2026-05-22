@@ -1,20 +1,17 @@
 """内置实体识别器。
 
-组合三路识别能力：
+组合多路识别能力：
 1) PaddleNLP Taskflow NER 的 wordtag 模型（优先）
-2) jieba 词性识别
+2) 可选 jieba 词性识别补漏
 3) 手机号正则抽取
 """
 
 import logging
 import re
 import shutil
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
-
-import jieba
-from jieba import posseg
 
 from .mapping import normalize_entity_type
 from .types import EntitySpan
@@ -79,6 +76,7 @@ class LocalEntityRecognizer:
         device_id: int = 0,
         max_text_len: int = 10000,
         enable_taskflow: bool = True,
+        enable_jieba_fallback: bool = False,
         strict_local_model: bool = True,
         auto_download_model: bool = True,
         sync_downloaded_model: bool = True,
@@ -90,6 +88,7 @@ class LocalEntityRecognizer:
         self.device_id = device_id
         self.max_text_len = max_text_len
         self.enable_taskflow = enable_taskflow
+        self.enable_jieba_fallback = enable_jieba_fallback
         self.strict_local_model = strict_local_model
         self.auto_download_model = auto_download_model
         self.sync_downloaded_model = sync_downloaded_model
@@ -99,7 +98,8 @@ class LocalEntityRecognizer:
             else Path.home() / ".paddlenlp" / "taskflow" / "wordtag"
         )
 
-        self._load_jieba_dicts()
+        if self.enable_jieba_fallback:
+            self._load_jieba_dicts()
         self._taskflow = self._build_taskflow()
 
     @property
@@ -109,6 +109,8 @@ class LocalEntityRecognizer:
 
     def _load_jieba_dicts(self) -> None:
         """加载本地词典，提升 jieba 对业务词的人名/机构识别效果。"""
+        import jieba
+
         name_dict = self.dict_dir / "name.txt"
         user_dict = self.dict_dir / "user.txt"
 
@@ -132,7 +134,7 @@ class LocalEntityRecognizer:
     def _build_taskflow(self):
         """按配置创建 Taskflow 推理实例，不可用时自动降级。"""
         if not self.enable_taskflow:
-            logger.info("Taskflow wordtag is disabled; fallback to jieba+regex only")
+            logger.info("Taskflow wordtag is disabled; fallback to regex and optional jieba")
             return None
 
         try:
@@ -142,7 +144,10 @@ class LocalEntityRecognizer:
                 raise RuntimeError(
                     "paddlenlp is required. Please install dependencies from requirements.txt"
                 ) from exc
-            logger.warning("paddlenlp is not available, fallback to jieba+regex only: %s", exc)
+            logger.warning(
+                "paddlenlp is not available, fallback to regex and optional jieba: %s",
+                exc,
+            )
             return None
 
         # 1) 优先加载本地 wordtag 模型目录。
@@ -176,7 +181,7 @@ class LocalEntityRecognizer:
             )
 
         logger.warning(
-            "Local model is unavailable; fallback to jieba+regex only. "
+            "Local model is unavailable; fallback to regex and optional jieba. "
             "model_path=%s auto_download_model=%s",
             self.model_path,
             self.auto_download_model,
@@ -262,12 +267,13 @@ class LocalEntityRecognizer:
         if not text or len(text) > self.max_text_len:
             return []
 
-        # 三路抽取并合并：Taskflow wordtag 为主，jieba 和手机号正则补漏。
+        # Taskflow wordtag 为主，手机号正则补漏；jieba 仅在显式开启时兜底。
         spans = [
             *self._extract_with_taskflow(text),
-            *self._extract_with_jieba(text),
             *self._extract_mobile(text),
         ]
+        if self.enable_jieba_fallback:
+            spans.extend(self._extract_with_jieba(text))
         return self._deduplicate_spans(spans, text)
 
     def recognize_custom(
@@ -296,38 +302,17 @@ class LocalEntityRecognizer:
 
     def _extract_with_taskflow(self, text: str) -> list[EntitySpan]:
         """使用 Taskflow NER wordtag 抽取人名/机构。"""
-        if self._taskflow is None:
+        pairs = self._extract_taskflow_pairs(text)
+        if not pairs:
             return []
 
-        try:
-            tagged = self._taskflow(text)
-        except Exception as exc:
-            if self.strict_local_model:
-                raise RuntimeError("Taskflow wordtag inference failed.") from exc
-            logger.warning("Taskflow inference failed, skip model extraction: %s", exc)
-            return []
-
-        pairs = list(self._iter_taskflow_tokens(tagged))
         if any(self._split_bioes_tag(tag)[0] for _, tag in pairs):
             return self._extract_bioes_taskflow_spans(text, pairs)
 
         spans: list[EntitySpan] = []
-        cursor = 0
 
         # Taskflow("ner") 的 accurate 模式内部使用 wordtag，通常返回 [(token, tag), ...]。
-        for token, tag in pairs:
-            if not token:
-                continue
-
-            start = self._find_token(text, token, cursor)
-            if start < 0:
-                continue
-            end = start + len(token)
-            cursor = end
-
-            if end > len(text):
-                continue
-
+        for token, tag, start, end in self._iter_located_tokens(text, pairs):
             self._append_model_span(spans, tag, token, start, end)
 
         return spans
@@ -338,59 +323,7 @@ class LocalEntityRecognizer:
         pairs: list[tuple[str, str]],
     ) -> list[EntitySpan]:
         """兼容 BIOES 标签序列输出。"""
-        spans: list[EntitySpan] = []
-        cursor = 0
-        active_label = ""
-        active_start = -1
-        active_text = ""
-
-        def flush_active() -> None:
-            nonlocal active_label, active_start, active_text
-            if active_label and active_start >= 0 and active_text:
-                end = active_start + len(active_text)
-                self._append_model_span(spans, active_label, active_text, active_start, end)
-            active_label = ""
-            active_start = -1
-            active_text = ""
-
-        for token, raw_tag in pairs:
-            if not token:
-                continue
-
-            start = self._find_token(text, token, cursor)
-            if start < 0:
-                flush_active()
-                continue
-
-            end = start + len(token)
-            cursor = end
-            prefix, label = self._split_bioes_tag(raw_tag)
-
-            if not prefix or not label:
-                flush_active()
-                continue
-
-            if prefix == "S":
-                flush_active()
-                self._append_model_span(spans, label, token, start, end)
-            elif prefix == "B":
-                flush_active()
-                active_label = label
-                active_start = start
-                active_text = token
-            elif prefix in {"I", "E"} and active_label == label:
-                active_text += token
-                if prefix == "E":
-                    flush_active()
-            else:
-                flush_active()
-                if prefix == "B":
-                    active_label = label
-                    active_start = start
-                    active_text = token
-
-        flush_active()
-        return spans
+        return self._extract_bioes_spans(text, pairs, self._make_model_span)
 
     def _extract_custom_with_taskflow(
         self,
@@ -398,36 +331,20 @@ class LocalEntityRecognizer:
         rules: list[tuple[str, set[str]]],
     ) -> list[EntitySpan]:
         """按自定义标签规则从 Taskflow 输出中抽取实体。"""
-        try:
-            tagged = self._taskflow(text)
-        except Exception as exc:
-            if self.strict_local_model:
-                raise RuntimeError("Taskflow wordtag inference failed.") from exc
-            logger.warning("Taskflow inference failed, skip custom extraction: %s", exc)
+        pairs = self._extract_taskflow_pairs(text)
+        if not pairs:
             return []
 
-        pairs = list(self._iter_taskflow_tokens(tagged))
         if any(self._split_bioes_tag(tag)[0] for _, tag in pairs):
             return self._extract_bioes_custom_taskflow_spans(text, pairs, rules)
 
         spans: list[EntitySpan] = []
-        cursor = 0
 
-        for token, tag in pairs:
-            if not token:
-                continue
-
-            start = self._find_token(text, token, cursor)
-            if start < 0:
-                continue
-            end = start + len(token)
-            cursor = end
-
+        for token, tag, start, end in self._iter_located_tokens(text, pairs):
             entity_type = self._match_custom_entity_type(tag, rules)
             if (
                 entity_type
                 and self._looks_valid_entity(entity_type, token)
-                and end <= len(text)
             ):
                 spans.append(EntitySpan(entity_type, token, start, end, "custom"))
 
@@ -440,6 +357,25 @@ class LocalEntityRecognizer:
         rules: list[tuple[str, set[str]]],
     ) -> list[EntitySpan]:
         """兼容 BIOES 标签序列的自定义实体抽取。"""
+        return self._extract_bioes_spans(
+            text,
+            pairs,
+            lambda label, token, start, end: self._make_custom_span(
+                label,
+                token,
+                start,
+                end,
+                rules,
+            ),
+        )
+
+    def _extract_bioes_spans(
+        self,
+        text: str,
+        pairs: list[tuple[str, str]],
+        span_factory: Callable[[str, str, int, int], EntitySpan | None],
+    ) -> list[EntitySpan]:
+        """把 BIOES token/tag 序列还原为实体片段。"""
         spans: list[EntitySpan] = []
         cursor = 0
         active_label = ""
@@ -448,15 +384,11 @@ class LocalEntityRecognizer:
 
         def flush_active() -> None:
             nonlocal active_label, active_start, active_text
-            entity_type = self._match_custom_entity_type(active_label, rules)
-            if (
-                entity_type
-                and active_start >= 0
-                and active_text
-                and self._looks_valid_entity(entity_type, active_text)
-            ):
+            if active_label and active_start >= 0 and active_text:
                 end = active_start + len(active_text)
-                spans.append(EntitySpan(entity_type, active_text, active_start, end, "custom"))
+                span = span_factory(active_label, active_text, active_start, end)
+                if span is not None:
+                    spans.append(span)
             active_label = ""
             active_start = -1
             active_text = ""
@@ -480,9 +412,9 @@ class LocalEntityRecognizer:
 
             if prefix == "S":
                 flush_active()
-                entity_type = self._match_custom_entity_type(label, rules)
-                if entity_type and self._looks_valid_entity(entity_type, token):
-                    spans.append(EntitySpan(entity_type, token, start, end, "custom"))
+                span = span_factory(label, token, start, end)
+                if span is not None:
+                    spans.append(span)
             elif prefix == "B":
                 flush_active()
                 active_label = label
@@ -494,10 +426,6 @@ class LocalEntityRecognizer:
                     flush_active()
             else:
                 flush_active()
-                if prefix == "B":
-                    active_label = label
-                    active_start = start
-                    active_text = token
 
         flush_active()
         return spans
@@ -561,10 +489,70 @@ class LocalEntityRecognizer:
         start: int,
         end: int,
     ) -> None:
+        span = self._make_model_span(tag, token, start, end)
+        if span is not None:
+            spans.append(span)
+
+    def _make_model_span(
+        self,
+        tag: str,
+        token: str,
+        start: int,
+        end: int,
+    ) -> EntitySpan | None:
         if self._is_org_tag(tag) and self._looks_valid_org(token):
-            spans.append(EntitySpan("ORG", token, start, end, self.TASKFLOW_ENTITY_SOURCE))
-        elif self._is_person_tag(tag) and self._looks_valid_person(token):
-            spans.append(EntitySpan("PERSON", token, start, end, self.TASKFLOW_ENTITY_SOURCE))
+            return EntitySpan("ORG", token, start, end, self.TASKFLOW_ENTITY_SOURCE)
+        if self._is_person_tag(tag) and self._looks_valid_person(token):
+            return EntitySpan("PERSON", token, start, end, self.TASKFLOW_ENTITY_SOURCE)
+        return None
+
+    def _make_custom_span(
+        self,
+        tag: str,
+        token: str,
+        start: int,
+        end: int,
+        rules: list[tuple[str, set[str]]],
+    ) -> EntitySpan | None:
+        entity_type = self._match_custom_entity_type(tag, rules)
+        if entity_type and self._looks_valid_entity(entity_type, token):
+            return EntitySpan(entity_type, token, start, end, "custom")
+        return None
+
+    def _extract_taskflow_pairs(self, text: str) -> list[tuple[str, str]]:
+        """执行 Taskflow 并归一化为 token/tag 二元组。"""
+        if self._taskflow is None:
+            return []
+
+        try:
+            tagged = self._taskflow(text)
+        except Exception as exc:
+            if self.strict_local_model:
+                raise RuntimeError("Taskflow wordtag inference failed.") from exc
+            logger.warning("Taskflow inference failed, skip model extraction: %s", exc)
+            return []
+
+        return list(self._iter_taskflow_tokens(tagged))
+
+    def _iter_located_tokens(
+        self,
+        text: str,
+        pairs: list[tuple[str, str]],
+    ) -> Iterator[tuple[str, str, int, int]]:
+        """把 Taskflow token 顺序还原到原文位置。"""
+        cursor = 0
+        for token, tag in pairs:
+            if not token:
+                continue
+
+            start = self._find_token(text, token, cursor)
+            if start < 0:
+                continue
+
+            end = start + len(token)
+            cursor = end
+            if end <= len(text):
+                yield token, tag, start, end
 
     @staticmethod
     def _find_token(text: str, token: str, cursor: int) -> int:
@@ -655,6 +643,8 @@ class LocalEntityRecognizer:
 
     def _extract_with_jieba(self, text: str) -> list[EntitySpan]:
         """使用 jieba 词性标注抽取人名/机构。"""
+        from jieba import posseg
+
         spans: list[EntitySpan] = []
         cursor = 0
 

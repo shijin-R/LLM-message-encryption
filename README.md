@@ -1,133 +1,39 @@
 # 大模型请求脱敏服务
 
-这是一个独立的 HTTP 服务，用于在业务请求发送给大模型前，对 `messages` 中的敏感实体做脱敏替换，并返回脱敏后的请求体与原文映射字典。
+## 项目用途
 
-## 功能范围
+本项目提供一个独立的 HTTP 前置服务，用于在业务请求发送给大模型前，对 `llm_request.messages` 中未标记为已脱敏的 `user` 消息执行敏感实体替换，并返回可继续转发给上游模型的请求体。
 
-- 处理 `llm_request.messages` 中未标记为已脱敏的 `user` 消息。
-- 将姓名、组织/公司、手机号等实体替换为结构化占位符，例如 `[[PERSON_001]]`、`[[ORG_001]]`、`[[MOBILE_001]]`。
-- 返回完整 `mapping`，由调用方自行保存并在后续请求中带回，以复用同一套占位符。
-- 默认使用 PaddleNLP `Taskflow("ner", entity_only=True)` 的 wordtag/accurate 模型识别姓名和组织；手机号使用正则补充识别。
+服务会将姓名、组织/公司、手机号等实体替换为结构化占位符，例如 `[[PERSON_001]]`、`[[ORG_001]]`、`[[MOBILE_001]]`。调用方需要保存接口返回的 `mapping`，并在下一轮请求的历史 `user` 消息中带回，以复用同一套占位符。
 
-本服务不保存会话状态，不持久化映射字典，不转发大模型请求，也不提供大模型响应还原接口。
+本服务不保存会话状态，不持久化映射字典，不转发大模型请求，也不提供大模型响应还原接口。实体识别、本地调试和模型准备细节见 [本地开发与模型准备](docs/local-development.md)。
 
-## 实体识别逻辑
+## 依赖前提
 
-服务当前使用的是 PaddleNLP `Taskflow("ner", entity_only=True)` 的 wordtag 模型链路，本地模型目录默认为 `resources/models/wordtag`。
+- Python 3.10。
+- 依赖包见 `requirements.txt`，核心依赖包括 Flask、PaddlePaddle、PaddleNLP 和 jieba。
+- 默认模型目录为 `resources/models/wordtag`；大模型文件不进入 Git 仓库，只保留目录说明文件。
+- 部署环境建议使用 Docker/Linux；Windows 本地开发可使用虚拟环境。
 
-一次脱敏会合并以下实体来源：
+关键环境变量：
 
-- 历史 `mapping`：已脱敏 user 消息携带的映射会被优先复用，确保同一实体继续使用原占位符。
-- 自定义模型标签：`custom_entities` 会声明业务实体类型与需要匹配的 wordtag 模型标签，命中后按声明的 `entity_type` 生成占位符。
-- 内置模型识别：wordtag 和 jieba 默认用于识别人名、组织/公司等中文实体。
-- 规则补漏：手机号使用正则识别，避免通用模型漏掉纯数字手机号。
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `HOST` | `127.0.0.1` | 本地启动监听地址；Dockerfile 内默认 `0.0.0.0` |
+| `PORT` | `18001` | 服务端口 |
+| `DESENSITIZE_MODEL_PATH` | `resources/models/wordtag` | 本地 wordtag 模型目录 |
+| `DESENSITIZE_AUTO_DOWNLOAD_MODEL` | `true` | 本地模型缺失时是否尝试自动下载 |
+| `DESENSITIZE_SYNC_DOWNLOADED_MODEL` | `true` | 自动下载后是否同步回本地模型目录 |
+| `DESENSITIZE_ENABLE_JIEBA_FALLBACK` | `false` | 是否启用 jieba 人名/机构补漏 |
 
-冲突处理时，服务会优先保留历史映射，其次是自定义实体，再是模型/正则/jieba 候选；同一优先级下倾向保留更长的片段，避免短片段覆盖完整实体。
+## 启动方式
 
-`custom_entities` 中的 `model_labels`、`labels` 或 `schema` 是“模型标签匹配规则”，不是独立的正则或字面值匹配。当前服务不会执行 `custom_entities.patterns`、`regex` 或 `values` 字段；这些字段即使传入，也只有在模型本身返回对应片段时才可能产生脱敏效果。
-
-地址类实体可声明为 `ADDRESS`。为了兼容业务写法，`ADDRESS` 内置了 `住址`、`地址`、`场所类`、`世界地区类`、`位置方位` 等标签别名，并会过滤 `住址`、`地址` 这类字段名。模型如果把连续地址切成多个片段，例如 `北京市海淀区` 与 `中关村大街27号`，服务会在两段紧邻且同为 `ADDRESS` 时合并成完整地址后再替换。
-
-示例：
-
-```json
-{
-  "custom_entities": [
-    {
-      "entity_type": "ADDRESS",
-      "model_labels": ["住址", "地址"]
-    }
-  ]
-}
-```
-
-对于账号、卡号等数字类隐私实体，当前只有手机号作为内置规则。后续如需支持银行卡号、平台账号、对公账户等，目前的考虑是另行设计专门的敏感实体识别链路（例如PP-UIE）。
-
-## 环境准备
-
-推荐使用 Python 3.10。项目当前依赖已在 Python 3.10.20 下验证，建议先创建并激活虚拟环境：
+本地启动：
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-```
-
-安装依赖：
-
-```powershell
 python -m pip install -r requirements.txt
-```
-
-依赖版本中 `paddlenlp==2.8.1` 需要 `aistudio-sdk==0.2.6`，不要随意升级该包。
-`tool-helpers` 是 PaddleNLP 声明的预训练辅助依赖，上游只发布 Linux wheel；Windows 本地如果安装时被该包阻塞，可使用已准备好的项目虚拟环境，部署交付优先使用 Docker/Linux 环境。
-
-## 准备模型
-
-服务默认从下面目录加载 wordtag 模型：
-
-```text
-resources/models/wordtag
-```
-
-推荐让服务首次启动时自动下载并同步模型：
-
-```powershell
-$env:DESENSITIZE_AUTO_DOWNLOAD_MODEL="true"
-$env:DESENSITIZE_SYNC_DOWNLOADED_MODEL="true"
-python -u app.py
-```
-
-首次启动会通过 PaddleNLP 下载默认 wordtag 模型。下载完成后，服务会把模型同步到 `resources/models/wordtag`，后续启动会优先读取该目录。
-
-如果运行环境无法直接访问外网，可以先在一台能访问模型源的机器上执行：
-
-```powershell
-python -c "from paddlenlp import Taskflow; Taskflow('ner', entity_only=True)"
-```
-
-下载完成后，将用户目录下的 PaddleNLP 缓存复制到项目模型目录：
-
-```powershell
-New-Item -ItemType Directory -Force .\resources\models\wordtag
-Copy-Item "$env:USERPROFILE\.paddlenlp\taskflow\wordtag\*" .\resources\models\wordtag -Recurse -Force
-```
-
-模型目录准备好后，可用下面命令检查：
-
-```powershell
-Get-ChildItem .\resources\models\wordtag
-```
-
-常见文件包括 `model_state.pdparams`、`config.json`、`vocab.txt` 和 `static` 推理文件。
-
-相关环境变量：
-
-| 变量 | 默认值 | 说明 |
-| --- | --- | --- |
-| `DESENSITIZE_MODEL_PATH` | `resources/models/wordtag` | 本地模型目录 |
-| `DESENSITIZE_DICT_DIR` | `resources/common_data/uie` | jieba 用户词典目录 |
-| `DESENSITIZE_ENABLE_TASKFLOW` | `true` | 是否启用 Taskflow |
-| `DESENSITIZE_STRICT_LOCAL_MODEL` | `true` | 模型不可用时是否启动失败 |
-| `DESENSITIZE_AUTO_DOWNLOAD_MODEL` | `true` | 本地模型缺失时是否尝试自动下载 |
-| `DESENSITIZE_SYNC_DOWNLOADED_MODEL` | `true` | 自动下载后是否同步回本地模型目录 |
-
-## 启动服务
-
-请先确认当前 `python` 指向项目虚拟环境，例如：
-
-```powershell
-python -c "import sys; print(sys.executable)"
-```
-
-如果没有激活虚拟环境，也可以直接使用项目内解释器：
-
-```powershell
-.\.venv\Scripts\python.exe -u app.py
-```
-
-已激活虚拟环境时：
-
-```powershell
 python -u app.py
 ```
 
@@ -143,29 +49,10 @@ http://127.0.0.1:18001
 Invoke-RestMethod "http://127.0.0.1:18001/healthz" | ConvertTo-Json -Depth 10
 ```
 
-重点关注：
-
-```json
-{
-  "status": "ok",
-  "using_taskflow": true,
-  "model_path": "resources/models/wordtag"
-}
-```
-
-`using_taskflow=true` 表示本地模型已经成功初始化。
-
-## Docker 运行
-
-构建镜像：
+Docker 启动：
 
 ```powershell
 docker build -t llm-messages-encryptor:latest .
-```
-
-默认推荐使用 Docker volume 保存模型。容器首次启动时会自动下载 wordtag 模型，并同步到 `/app/resources/models/wordtag`；后续再次启动会复用 volume 中的模型文件。
-
-```powershell
 docker volume create llm_messages_encryptor_model
 
 docker run --rm `
@@ -175,29 +62,15 @@ docker run --rm `
   llm-messages-encryptor:latest
 ```
 
-如果运行环境不能直接下载模型，也可以先在宿主机准备好 `resources/models/wordtag`，再把本机模型目录挂载到容器：
+## 接口示例
 
-```powershell
-docker run --rm `
-  -p 18001:18001 `
-  -v ${PWD}/resources/models/wordtag:/app/resources/models/wordtag `
-  --name llm-messages-encryptor `
-  llm-messages-encryptor:latest
-```
-
-容器启动后访问健康检查：
-
-```powershell
-Invoke-RestMethod "http://127.0.0.1:18001/healthz" | ConvertTo-Json -Depth 10
-```
-
-## 接口
+接口地址：
 
 ```text
 POST /v1/llm/preprocess
 ```
 
-请求体格式：
+请求示例：
 
 ```json
 {
@@ -210,44 +83,62 @@ POST /v1/llm/preprocess
         "encrypted": false
       }
     ]
-  }
+  },
+  "custom_entities": [
+    {
+      "entity_type": "ADDRESS",
+      "model_labels": ["住址", "地址"]
+    }
+  ]
 }
 ```
 
-关键字段：
+字段说明：
 
-- `llm_request`：原始大模型请求体，服务会保留其中除 `messages` 外的其他字段。
-- `messages[].encrypted`：`true` 表示该条 user 消息已经脱敏，本次跳过；`false` 或缺失表示需要本次脱敏。
-- `messages[].mapping`：历史已脱敏 user 消息携带的映射字典，用于复用占位符。
-- `custom_entities`：可选，声明需要本地模型额外关注的实体标签。
+- `llm_request`：原始大模型请求体，服务会保留其中除 `messages` 内部控制字段外的其他内容。
+- `messages[].encrypted`：`true` 表示该条 `user` 消息已经脱敏，本次跳过；`false` 或缺失表示需要本次脱敏。
+- `messages[].mapping`：历史已脱敏 `user` 消息携带的映射字典，仅在 `encrypted=true` 时用于复用占位符。
+- `custom_entities`：可选，声明需要本地模型额外关注的实体标签；当前不会执行 `patterns`、`regex` 或 `values` 字符串匹配。
 
-成功响应格式：
+成功响应示例：
 
 ```json
 {
   "code": 0,
   "message": "ok",
   "data": {
-    "desensitized_request": {},
-    "mapping": {},
-    "stats": {}
+    "desensitized_request": {
+      "model": "gpt-4o-mini",
+      "messages": [
+        {
+          "role": "user",
+          "content": "合同甲方：[[ORG_001]]，联系人[[PERSON_001]]，手机号[[MOBILE_001]]。"
+        }
+      ]
+    },
+    "mapping": {
+      "PERSON": {
+        "张三": "[[PERSON_001]]"
+      },
+      "ORG": {
+        "上海泛微网络科技股份有限公司": "[[ORG_001]]"
+      },
+      "MOBILE": {
+        "13800138000": "[[MOBILE_001]]"
+      }
+    },
+    "stats": {
+      "total_messages": 1,
+      "processed_messages": 1,
+      "processed_message_indexes": [0],
+      "replacements": 3,
+      "new_entities": 3
+    }
   }
 }
 ```
 
-调用方应使用 `data.desensitized_request` 继续请求上游大模型，并保存 `data.mapping` 供下一轮对话复用。
-
-## 示例请求
-
-项目提供两个示例 JSON，便于联调和理解历史映射复用流程。
-
-`example_preprocess_request.json` 演示普通预处理请求：
-
-- 包含一条已脱敏的历史 user 消息和一条新的未脱敏 user 消息。
-- 服务会复用历史 `mapping`，把新消息中的相同实体替换为已有占位符。
-- 适合验证 `encrypted=false` 的 user 消息是否会被正确脱敏。
-
-调用示例：
+联调时可直接使用仓库内示例文件：
 
 ```powershell
 $body = Get-Content .\example_preprocess_request.json -Raw -Encoding UTF8
@@ -259,28 +150,11 @@ Invoke-RestMethod `
   -Body $body | ConvertTo-Json -Depth 20
 ```
 
-`example_history_reuse_request.json` 演示多轮对话中的历史映射复用：
+## 部署注意事项
 
-- 历史 user 消息携带上一次保存的 `mapping`。
-- 新 user 消息再次出现相同姓名、组织时，会继续使用原来的占位符。
-- 新出现的手机号会分配新的占位符，例如 `[[MOBILE_002]]`。
-
-调用示例：
-
-```powershell
-$body = Get-Content .\example_history_reuse_request.json -Raw -Encoding UTF8
-
-Invoke-RestMethod `
-  -Method Post `
-  -Uri "http://127.0.0.1:18001/v1/llm/preprocess" `
-  -ContentType "application/json; charset=utf-8" `
-  -Body $body | ConvertTo-Json -Depth 20
-```
-
-业务方实际接入时，建议每次请求后保存接口返回的 `data.mapping`；下一轮请求中，把该映射放到对应的历史 user message 的 `mapping` 字段，并将该历史消息标记为 `encrypted=true`。
-
-## 测试
-
-```powershell
-python -m unittest discover -s tests
-```
+- 内网或离线环境需要提前准备 `resources/models/wordtag`，或挂载包含模型文件的 Docker volume；启动后通过 `/healthz` 确认 `using_taskflow=true`。
+- `resources/models/wordtag` 下的模型权重、缓存和推理文件较大，仓库只保留 `README.md`，不要提交实际模型文件。
+- 服务是无状态的，调用方必须保存 `data.mapping`，并在后续历史 `user` 消息中携带该映射和 `encrypted=true` 标记。
+- 返回的 `data.desensitized_request.messages` 会移除 `encrypted` 和 `mapping` 字段，可直接继续请求上游大模型。
+- jieba 补漏默认关闭，只有在明确接受更高误报风险时再设置 `DESENSITIZE_ENABLE_JIEBA_FALLBACK=true`。
+- 仓库文件保留/排除规则见 [仓库文件检查](docs/repository-files.md)。

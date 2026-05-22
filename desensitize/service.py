@@ -27,6 +27,7 @@ class DesensitizeService:
             device_id=config.device_id,
             max_text_len=config.max_text_len,
             enable_taskflow=config.enable_taskflow,
+            enable_jieba_fallback=config.enable_jieba_fallback,
             strict_local_model=config.strict_local_model,
             auto_download_model=config.auto_download_model,
             sync_downloaded_model=config.sync_downloaded_model,

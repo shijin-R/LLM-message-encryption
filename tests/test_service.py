@@ -339,6 +339,39 @@ class DesensitizeServiceTest(unittest.TestCase):
 
         self.assertEqual(matches, ["13800138000"])
 
+    def test_jieba_fallback_is_disabled_by_default(self) -> None:
+        recognizer = LocalEntityRecognizer.__new__(LocalEntityRecognizer)
+        recognizer.max_text_len = 10000
+        recognizer.enable_jieba_fallback = False
+        recognizer._taskflow = None
+        recognizer._extract_with_taskflow = lambda text: []
+        recognizer._extract_mobile = lambda text: []
+        recognizer._extract_with_jieba = lambda text: [
+            EntitySpan("PERSON", "籍贯", 0, 2, "jieba")
+        ]
+
+        spans = recognizer.recognize_builtin("籍贯浙江省杭州市")
+
+        self.assertEqual(spans, [])
+
+    def test_jieba_fallback_can_be_enabled(self) -> None:
+        recognizer = LocalEntityRecognizer.__new__(LocalEntityRecognizer)
+        recognizer.max_text_len = 10000
+        recognizer.enable_jieba_fallback = True
+        recognizer._taskflow = None
+        recognizer._extract_with_taskflow = lambda text: []
+        recognizer._extract_mobile = lambda text: []
+        recognizer._extract_with_jieba = lambda text: [
+            EntitySpan("PERSON", "李四", 1, 3, "jieba")
+        ]
+
+        spans = recognizer.recognize_builtin("请李四确认")
+
+        self.assertEqual(
+            [(span.entity_type, span.text, span.source) for span in spans],
+            [("PERSON", "李四", "jieba")],
+        )
+
     def test_custom_person_model_result_filters_role_word(self) -> None:
         recognizer = LocalEntityRecognizer.__new__(LocalEntityRecognizer)
         recognizer.max_text_len = 10000

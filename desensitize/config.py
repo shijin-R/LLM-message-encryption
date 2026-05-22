@@ -28,6 +28,8 @@ class ServiceConfig:
     max_text_len: int = 10000
     # 是否启用 PaddleNLP Taskflow wordtag 模型识别。
     enable_taskflow: bool = True
+    # 是否启用 jieba 人名/机构补漏；默认关闭以减少误报。
+    enable_jieba_fallback: bool = False
     # 严格模式：模型不可用时启动报错；本服务要求必须使用 Taskflow wordtag。
     strict_local_model: bool = True
     # 本地模型缺失时是否允许自动下载默认模型。
@@ -42,34 +44,24 @@ class ServiceConfig:
         """从环境变量构建配置对象，并把相对路径标准化为绝对路径。"""
         project_root = Path(__file__).resolve().parents[1]
 
-        model_path = Path(
-            os.getenv(
-                "DESENSITIZE_MODEL_PATH",
-                str(project_root / "resources" / "models" / "wordtag"),
-            )
-        ).expanduser()
-        if not model_path.is_absolute():
-            model_path = (project_root / model_path).resolve()
+        def resolve_path(env_name: str, default: Path) -> Path:
+            path = Path(os.getenv(env_name, str(default))).expanduser()
+            if path.is_absolute():
+                return path
+            return (project_root / path).resolve()
 
-        dict_dir = Path(
-            os.getenv(
-                "DESENSITIZE_DICT_DIR",
-                str(project_root / "resources" / "common_data" / "uie"),
-            )
-        ).expanduser()
-        if not dict_dir.is_absolute():
-            dict_dir = (project_root / dict_dir).resolve()
-
-        downloaded_model_cache_path = Path(
-            os.getenv(
-                "DESENSITIZE_MODEL_CACHE_PATH",
-                str(Path.home() / ".paddlenlp" / "taskflow" / "wordtag"),
-            )
-        ).expanduser()
-        if not downloaded_model_cache_path.is_absolute():
-            downloaded_model_cache_path = (
-                project_root / downloaded_model_cache_path
-            ).resolve()
+        model_path = resolve_path(
+            "DESENSITIZE_MODEL_PATH",
+            project_root / "resources" / "models" / "wordtag",
+        )
+        dict_dir = resolve_path(
+            "DESENSITIZE_DICT_DIR",
+            project_root / "resources" / "common_data" / "uie",
+        )
+        downloaded_model_cache_path = resolve_path(
+            "DESENSITIZE_MODEL_CACHE_PATH",
+            Path.home() / ".paddlenlp" / "taskflow" / "wordtag",
+        )
 
         return cls(
             model_path=model_path,
@@ -77,6 +69,10 @@ class ServiceConfig:
             device_id=int(os.getenv("DESENSITIZE_DEVICE_ID", "0")),
             max_text_len=int(os.getenv("DESENSITIZE_MAX_TEXT_LEN", "10000")),
             enable_taskflow=_env_to_bool("DESENSITIZE_ENABLE_TASKFLOW", True),
+            enable_jieba_fallback=_env_to_bool(
+                "DESENSITIZE_ENABLE_JIEBA_FALLBACK",
+                False,
+            ),
             strict_local_model=_env_to_bool("DESENSITIZE_STRICT_LOCAL_MODEL", True),
             auto_download_model=_env_to_bool("DESENSITIZE_AUTO_DOWNLOAD_MODEL", True),
             sync_downloaded_model=_env_to_bool("DESENSITIZE_SYNC_DOWNLOADED_MODEL", True),

@@ -31,6 +31,7 @@ def create_app() -> Flask:
                 "model_path": str(config.model_path),
                 "strict_local_model": config.strict_local_model,
                 "enable_taskflow": config.enable_taskflow,
+                "enable_jieba_fallback": config.enable_jieba_fallback,
                 "auto_download_model": config.auto_download_model,
                 "sync_downloaded_model": config.sync_downloaded_model,
                 "model_cache_path": str(config.downloaded_model_cache_path),
