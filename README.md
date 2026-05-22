@@ -13,13 +13,21 @@
 
 ## 环境准备
 
-建议使用 Python 3.10+。安装依赖：
+推荐使用 Python 3.10。项目当前依赖已在 Python 3.10.20 下验证，建议先创建并激活虚拟环境：
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+```
+
+安装依赖：
 
 ```powershell
 python -m pip install -r requirements.txt
 ```
 
 依赖版本中 `paddlenlp==2.8.1` 需要 `aistudio-sdk==0.2.6`，不要随意升级该包。
+`tool-helpers` 是 PaddleNLP 声明的预训练辅助依赖，上游只发布 Linux wheel；Windows 本地如果安装时被该包阻塞，可使用已准备好的项目虚拟环境，部署交付优先使用 Docker/Linux 环境。
 
 ## 准备模型
 
@@ -34,7 +42,7 @@ resources/models/wordtag
 ```powershell
 $env:DESENSITIZE_AUTO_DOWNLOAD_MODEL="true"
 $env:DESENSITIZE_SYNC_DOWNLOADED_MODEL="true"
-python app.py
+python -u app.py
 ```
 
 首次启动会通过 PaddleNLP 下载默认 wordtag 模型。下载完成后，服务会把模型同步到 `resources/models/wordtag`，后续启动会优先读取该目录。
@@ -73,8 +81,22 @@ Get-ChildItem .\resources\models\wordtag
 
 ## 启动服务
 
+请先确认当前 `python` 指向项目虚拟环境，例如：
+
 ```powershell
-python app.py
+python -c "import sys; print(sys.executable)"
+```
+
+如果没有激活虚拟环境，也可以直接使用项目内解释器：
+
+```powershell
+.\.venv\Scripts\python.exe -u app.py
+```
+
+已激活虚拟环境时：
+
+```powershell
+python -u app.py
 ```
 
 默认监听：
@@ -100,6 +122,42 @@ Invoke-RestMethod "http://127.0.0.1:18001/healthz" | ConvertTo-Json -Depth 10
 ```
 
 `using_taskflow=true` 表示本地模型已经成功初始化。
+
+## Docker 运行
+
+构建镜像：
+
+```powershell
+docker build -t llm-messages-encryptor:latest .
+```
+
+默认推荐使用 Docker volume 保存模型。容器首次启动时会自动下载 wordtag 模型，并同步到 `/app/resources/models/wordtag`；后续再次启动会复用 volume 中的模型文件。
+
+```powershell
+docker volume create llm_messages_encryptor_model
+
+docker run --rm `
+  -p 18001:18001 `
+  -v llm_messages_encryptor_model:/app/resources/models/wordtag `
+  --name llm-messages-encryptor `
+  llm-messages-encryptor:latest
+```
+
+如果运行环境不能直接下载模型，也可以先在宿主机准备好 `resources/models/wordtag`，再把本机模型目录挂载到容器：
+
+```powershell
+docker run --rm `
+  -p 18001:18001 `
+  -v ${PWD}/resources/models/wordtag:/app/resources/models/wordtag `
+  --name llm-messages-encryptor `
+  llm-messages-encryptor:latest
+```
+
+容器启动后访问健康检查：
+
+```powershell
+Invoke-RestMethod "http://127.0.0.1:18001/healthz" | ConvertTo-Json -Depth 10
+```
 
 ## 接口
 
