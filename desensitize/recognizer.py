@@ -35,6 +35,20 @@ class LocalEntityRecognizer:
         "PERSON": {"person", "姓名", "人名", "人物", "姓氏"},
         "ORG": {"org", "organization", "组织", "机构", "公司", "企业", "品牌"},
         "MOBILE": {"mobile", "phone", "手机号", "手机号码", "电话"},
+        "ADDRESS": {
+            "address",
+            "住址",
+            "地址",
+            "场所",
+            "场所类",
+            "交通场所",
+            "网上场所",
+            "世界地区",
+            "世界地区类",
+            "地理概念",
+            "区划概念",
+            "位置方位",
+        },
     }
 
     PERSON_BAD_CASE = {
@@ -46,6 +60,17 @@ class LocalEntityRecognizer:
         "今天下午",
     }
     ORG_BAD_CASE = {"集团", "各部门"}
+    ADDRESS_BAD_CASE = {
+        "地址",
+        "住址",
+        "现住址",
+        "家庭住址",
+        "联系地址",
+        "通信地址",
+        "通讯地址",
+        "收货地址",
+        "户籍地址",
+    }
 
     def __init__(
         self,
@@ -266,6 +291,7 @@ class LocalEntityRecognizer:
             return []
 
         spans = self._extract_custom_with_taskflow(text, rules)
+        spans = self._merge_adjacent_custom_spans(spans, text)
         return self._deduplicate_spans(spans, text)
 
     def _extract_with_taskflow(self, text: str) -> list[EntitySpan]:
@@ -712,7 +738,58 @@ class LocalEntityRecognizer:
             return self._looks_valid_person(token)
         if normalized_type == "ORG":
             return self._looks_valid_org(token)
+        if normalized_type == "ADDRESS":
+            return self._looks_valid_address(token)
         return self._looks_valid_custom(token)
+
+    def _looks_valid_address(self, token: str) -> bool:
+        """过滤字段名，保留更像真实地点/地址的候选。"""
+        text = token.strip()
+        if len(text) <= 1:
+            return False
+        if text in self.ADDRESS_BAD_CASE:
+            return False
+        if not re.search(r"[\u4e00-\u9fffA-Za-z0-9]", text):
+            return False
+        if re.search(r"\d", text):
+            return True
+        return bool(re.search(r"[省市区县镇乡村街路巷道号楼室园场站口]", text))
+
+    def _merge_adjacent_custom_spans(
+        self,
+        spans: list[EntitySpan],
+        text: str,
+    ) -> list[EntitySpan]:
+        """合并模型切开的连续地址片段。"""
+        if not spans:
+            return []
+
+        merged: list[EntitySpan] = []
+        for span in sorted(spans, key=lambda item: (item.start, item.end)):
+            if merged and self._should_merge_custom_span(merged[-1], span, text):
+                previous = merged[-1]
+                merged[-1] = EntitySpan(
+                    entity_type=previous.entity_type,
+                    text=text[previous.start : span.end],
+                    start=previous.start,
+                    end=span.end,
+                    source=previous.source,
+                )
+                continue
+            merged.append(span)
+        return merged
+
+    @staticmethod
+    def _should_merge_custom_span(
+        left: EntitySpan,
+        right: EntitySpan,
+        text: str,
+    ) -> bool:
+        if left.entity_type != "ADDRESS" or right.entity_type != "ADDRESS":
+            return False
+        if left.source != "custom" or right.source != "custom":
+            return False
+        return text[left.end : right.start] == ""
 
     @staticmethod
     def _looks_valid_custom(token: str) -> bool:

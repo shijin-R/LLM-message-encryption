@@ -358,6 +358,28 @@ class DesensitizeServiceTest(unittest.TestCase):
             [("PERSON", "张三", "custom")],
         )
 
+    def test_custom_address_alias_matches_location_tags_and_filters_field_word(self) -> None:
+        recognizer = LocalEntityRecognizer.__new__(LocalEntityRecognizer)
+        recognizer.max_text_len = 10000
+        recognizer.strict_local_model = True
+        recognizer._taskflow = lambda text: [
+            ("住址", "场所类"),
+            ("北京市海淀区", "世界地区类"),
+            ("中关村大街27号", "世界地区类"),
+        ]
+
+        spans = recognizer.recognize_custom(
+            "住址：北京市海淀区中关村大街27号",
+            [{"entity_type": "ADDRESS", "model_labels": ["住址", "地址"]}],
+        )
+
+        self.assertEqual(
+            [(span.entity_type, span.text, span.source) for span in spans],
+            [
+                ("ADDRESS", "北京市海淀区中关村大街27号", "custom"),
+            ],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
