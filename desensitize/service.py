@@ -2,7 +2,7 @@ from typing import Any
 
 from .config import ServiceConfig
 from .mapping import MappingStore, is_placeholder_token
-from .recognizer import LocalEntityRecognizer
+from .recognizer_factory import build_api_recognizer
 from .types import EntitySpan
 
 
@@ -20,22 +20,7 @@ class DesensitizeService:
 
     def __init__(self, config: ServiceConfig) -> None:
         self.config = config
-        self.recognizer = LocalEntityRecognizer(
-            model_path=config.model_path,
-            device_id=config.device_id,
-            max_text_len=config.max_text_len,
-            enable_taskflow=config.enable_taskflow,
-            strict_local_model=config.strict_local_model,
-            auto_download_model=config.auto_download_model,
-            sync_downloaded_model=config.sync_downloaded_model,
-            downloaded_model_cache_path=config.downloaded_model_cache_path,
-            enable_uie_custom=config.enable_uie_custom,
-            uie_model_name=config.uie_model_name,
-            uie_model_path=config.uie_model_path,
-            uie_position_prob=config.uie_position_prob,
-            strict_uie_model=config.strict_uie_model,
-            downloaded_uie_model_cache_path=config.downloaded_uie_model_cache_path,
-        )
+        self.recognizer = build_api_recognizer(config)
 
     def _desensitize_messages(
         self,
@@ -180,12 +165,11 @@ class DesensitizeService:
         # 三路实体来源：已有映射、自定义 UIE 识别、内置识别。
         # 已有映射用于保证占位符复用；内置识别由 wordtag 和手机号规则组成。
         mapping_spans = self._extract_mapping_spans(text, mapping_store.mapping)
-        custom_spans = self.recognizer.recognize_custom(text, custom_entities)
-        builtin_spans = self.recognizer.recognize_builtin(text)
+        model_spans = self._recognize_text(text, custom_entities)
 
         selected_spans = self._resolve_overlaps(
             text,
-            mapping_spans + custom_spans + builtin_spans,
+            mapping_spans + model_spans,
         )
 
         if not selected_spans:
@@ -205,6 +189,20 @@ class DesensitizeService:
             replacement_count += 1
 
         return masked_text, replacement_count
+
+    def _recognize_text(
+        self,
+        text: str,
+        custom_entities: list[Any],
+    ) -> list[EntitySpan]:
+        """执行模型识别；远程后端可用组合接口减少 HTTP 往返。"""
+        recognize = getattr(self.recognizer, "recognize", None)
+        if callable(recognize):
+            return list(recognize(text, custom_entities))
+        return [
+            *self.recognizer.recognize_custom(text, custom_entities),
+            *self.recognizer.recognize_builtin(text),
+        ]
 
     def _extract_mapping_spans(
         self,

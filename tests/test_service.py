@@ -78,6 +78,36 @@ class FakeUIETaskflow:
         return [result]
 
 
+class CombinedRecognizer:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def recognize(self, text: str, custom_entities: list[dict]) -> list[EntitySpan]:
+        self.calls += 1
+        start = text.find("13800138000")
+        if start < 0:
+            return []
+        return [
+            EntitySpan(
+                "MOBILE",
+                "13800138000",
+                start,
+                start + len("13800138000"),
+                "regex",
+            )
+        ]
+
+    def recognize_builtin(self, text: str) -> list[EntitySpan]:
+        raise AssertionError("combined recognizer should use recognize()")
+
+    def recognize_custom(
+        self,
+        text: str,
+        custom_entities: list[dict],
+    ) -> list[EntitySpan]:
+        raise AssertionError("combined recognizer should use recognize()")
+
+
 class DesensitizeServiceTest(unittest.TestCase):
     def setUp(self) -> None:
         config = ServiceConfig(
@@ -248,6 +278,26 @@ class DesensitizeServiceTest(unittest.TestCase):
             "手机号[[MOBILE_001]]",
         )
         self.assertEqual(result["mapping"]["MOBILE"]["13800138000"], "[[MOBILE_001]]")
+
+    def test_combined_recognizer_is_used_when_available(self) -> None:
+        recognizer = CombinedRecognizer()
+        self.service.recognizer = recognizer
+
+        result = self.preprocess(
+            [
+                {
+                    "role": "user",
+                    "content": "手机号13800138000",
+                    "encrypted": False,
+                }
+            ]
+        )
+
+        self.assertEqual(recognizer.calls, 1)
+        self.assertEqual(
+            result["desensitized_request"]["messages"][0]["content"],
+            "手机号[[MOBILE_001]]",
+        )
 
     def test_all_unencrypted_user_content_is_processed(self) -> None:
         result = self.preprocess(

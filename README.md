@@ -1,88 +1,118 @@
 # 大模型请求脱敏服务
 
-## 项目用途
+## 项目说明
 
-本项目提供一个独立的 HTTP 前置服务，用于在业务请求发送给大模型前，对 `llm_request.messages` 中未标记为已脱敏的 `user` 消息执行敏感实体替换，并返回可继续转发给上游模型的请求体。
+本项目提供一个 HTTP 前置服务，用于在业务请求发送给大模型前，对 `llm_request.messages` 中未脱敏的 `user` 消息执行敏感实体替换，并返回可直接转发给上游模型的请求体。
 
-服务会将姓名、组织/公司、手机号，以及通过 UIE 声明的身份证号、银行卡号、地址等实体替换为结构化占位符，例如 `[[PERSON_001]]`、`[[ORG_001]]`、`[[MOBILE_001]]`。调用方需要保存接口返回的 `mapping`，并在下一轮请求的历史 `user` 消息中带回，以复用同一套占位符。
+服务会把姓名、组织/公司、手机号，以及通过 UIE 声明的身份证号、银行卡号、地址等实体替换为结构化占位符，例如 `[[PERSON_001]]`、`[[ORG_001]]`、`[[MOBILE_001]]`。
 
-本服务不保存会话状态，不持久化映射字典，不转发大模型请求，也不提供大模型响应还原接口。实体识别、本地调试和模型准备细节见 [本地开发与模型准备](docs/local-development.md)。
+服务本身不保存会话状态，不持久化 `mapping`，不转发大模型请求，也不提供大模型响应还原接口。调用方需要保存接口返回的 `data.mapping`，并在后续历史 `user` 消息中带回，以复用同一套占位符。
 
-## 依赖前提
+## 服务架构
 
-- Python 3.10。
-- 依赖包见 `requirements.txt`，核心依赖包括 Flask、PaddlePaddle 和 PaddleNLP。
-- 默认模型目录为 `resources/models/wordtag`；UIE 旁路模型目录为 `resources/models/uie-base`。模型文件不进入 Git 仓库，只保留目录说明文件。
-- 部署环境建议使用 Docker/Linux；Windows 本地开发可使用虚拟环境。
-
-关键环境变量：
-
-| 变量 | 默认值 | 说明 |
-| --- | --- | --- |
-| `HOST` | `127.0.0.1` | 本地启动监听地址；Dockerfile 内默认 `0.0.0.0` |
-| `PORT` | `18001` | 服务端口 |
-| `DESENSITIZE_MODEL_PATH` | `resources/models/wordtag` | 本地 wordtag 模型目录 |
-| `DESENSITIZE_ENABLE_UIE_CUSTOM` | `true` | 是否启用 UIE 信息抽取旁路识别业务自定义实体；开启后仍按请求懒加载 |
-| `DESENSITIZE_UIE_MODEL_NAME` | `uie-base` | UIE 信息抽取模型名 |
-| `DESENSITIZE_UIE_MODEL_PATH` | `resources/models/uie-base` | 本地 UIE 模型目录 |
-| `DESENSITIZE_UIE_POSITION_PROB` | `0.5` | UIE 起止位置概率阈值 |
-| `DESENSITIZE_STRICT_UIE_MODEL` | `false` | UIE 不可用时是否抛错 |
-| `DESENSITIZE_AUTO_DOWNLOAD_MODEL` | `true` | 本地模型缺失时是否尝试自动下载 |
-| `DESENSITIZE_SYNC_DOWNLOADED_MODEL` | `true` | 自动下载后是否同步回本地模型目录 |
-
-## 启动方式
-
-本地启动：
-
-```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install -r requirements.txt
-python -u app.py
-```
-
-UIE 自定义实体旁路默认开启，但会懒加载：服务启动时不会立即加载 `uie-base`，只有请求里的 `custom_entities` 包含 `uie_schema` 时才会加载或下载 UIE 模型。若部署环境不希望使用 UIE，可在启动前设置 `$env:DESENSITIZE_ENABLE_UIE_CUSTOM="false"`。
-
-默认监听：
+生产部署建议拆成两个服务：
 
 ```text
-http://127.0.0.1:18001
+业务系统 -> API 服务 app.py:18001 -> 模型服务 model_app.py:18002
+```
+
+- API 服务：负责请求校验、历史 `mapping` 复用、冲突消解和占位符替换，默认通过 HTTP 调用模型服务，只需要 `requirements-api.txt`。
+- 模型服务：常驻加载 wordtag 和 `uie-base`，提供实体识别接口，可被多个 API 服务共享，需要 `requirements-model.txt`。
+- 单进程本地模式：仅建议本地调试使用，需要显式设置 `DESENSITIZE_RECOGNIZER_BACKEND=local`。
+
+当前识别策略：
+
+- 内置实体：wordtag 模型 + 手机号规则补漏。
+- 自定义实体：全部交给 `uie-base`，通过 `custom_entities[].uie_schema` 声明抽取目标。
+- 除手机号外，不再执行自定义正则、固定值、字符串模式或 `model_labels` 匹配。
+
+## 依赖与模型
+
+- 推荐 Python 3.10。
+- `requirements-api.txt`：API 服务轻量依赖。
+- `requirements-model.txt`：模型服务完整依赖，包含 PaddlePaddle 和 PaddleNLP。
+- `requirements.txt`：兼容入口，指向模型侧完整依赖。
+- wordtag 默认目录：`resources/models/wordtag`。
+- UIE 默认目录：`resources/models/uie-base`。
+
+实际模型权重、缓存和推理文件不进入 Git 仓库。模型文件只需要准备在模型服务侧，API 服务侧不需要安装 PaddlePaddle、PaddleNLP，也不需要挂载模型目录。
+
+## 快速启动
+
+先启动模型服务：
+
+```powershell
+python -m pip install -r requirements-model.txt
+$env:MODEL_PORT="18002"
+python -u model_app.py
+```
+
+再启动 API 服务：
+
+```powershell
+python -m pip install -r requirements-api.txt
+$env:DESENSITIZE_MODEL_SERVICE_URL="http://127.0.0.1:18002"
+python -u app.py
 ```
 
 健康检查：
 
 ```powershell
 Invoke-RestMethod "http://127.0.0.1:18001/healthz" | ConvertTo-Json -Depth 10
+Invoke-RestMethod "http://127.0.0.1:18001/readyz" | ConvertTo-Json -Depth 10
+Invoke-RestMethod "http://127.0.0.1:18002/readyz" | ConvertTo-Json -Depth 10
 ```
 
-重点关注字段示例：
+重点关注：
 
-```json
-{
-  "status": "ok",
-  "using_taskflow": true,
-  "enable_uie_custom": true,
-  "using_uie": false,
-  "uie_model_path": "resources/models/uie-base"
-}
-```
+- `recognizer_backend` 应为 `remote`。
+- `model_service_status` 应为 `ok`。
+- `model_service.using_taskflow` 应为 `true`。
+- `model_service.enable_uie_custom` 应为 `true`。
+- 开启 UIE 预加载时，`model_service.using_uie` 应为 `true`。
 
-`using_uie=false` 不代表 UIE 未开启；服务刚启动且尚未处理带 `uie_schema` 的请求时，UIE 会保持未加载状态。
+## Docker 快速部署
 
-Docker 启动：
+构建两个镜像：
 
 ```powershell
-docker build -t llm-messages-encryptor:latest .
+docker build --target model -t llm-messages-encryptor-model:latest .
+docker build --target api -t llm-messages-encryptor-api:latest .
+```
+
+同一台 Docker 主机部署时，两个容器加入同一个 Docker network，API 服务可通过模型容器名访问模型服务：
+
+```powershell
+docker network create llm_messages_encryptor_net
 docker volume create llm_messages_encryptor_model
 docker volume create llm_messages_encryptor_uie_model
 
-docker run --rm `
-  -p 18001:18001 `
+docker run -d `
+  --restart unless-stopped `
+  --network llm_messages_encryptor_net `
+  -e MODEL_HOST=0.0.0.0 `
+  -e MODEL_PORT=18002 `
   -v llm_messages_encryptor_model:/app/resources/models/wordtag `
   -v llm_messages_encryptor_uie_model:/app/resources/models/uie-base `
-  --name llm-messages-encryptor `
-  llm-messages-encryptor:latest
+  --name llm-messages-encryptor-model `
+  llm-messages-encryptor-model:latest
+
+docker run -d `
+  --restart unless-stopped `
+  --network llm_messages_encryptor_net `
+  -p 18001:18001 `
+  -e DESENSITIZE_MODEL_SERVICE_URL=http://llm-messages-encryptor-model:18002 `
+  --name llm-messages-encryptor-api `
+  llm-messages-encryptor-api:latest
 ```
+
+跨主机部署时，普通 Docker network 不能跨主机使用容器名，API 服务应配置模型服务机器的内网 IP 或内网 DNS：
+
+```text
+DESENSITIZE_MODEL_SERVICE_URL=http://模型服务机器内网IP:18002
+```
+
+完整镜像交付、Bash 命令、跨主机部署、离线模型挂载和生产环境变量说明见 [开发、部署与模型准备](docs/local-development.md)。
 
 ## 接口示例
 
@@ -119,58 +149,29 @@ POST /v1/llm/preprocess
 }
 ```
 
-字段说明：
+响应中的核心字段：
 
-- `llm_request`：原始大模型请求体，服务会保留其中除 `messages` 内部控制字段外的其他内容。
-- `messages[].encrypted`：`true` 表示该条 `user` 消息已经脱敏，本次跳过；`false` 或缺失表示需要本次脱敏。
-- `messages[].mapping`：历史已脱敏 `user` 消息携带的映射字典，仅在 `encrypted=true` 时用于复用占位符。
-- `custom_entities`：可选，声明需要 UIE 旁路额外关注的业务实体；`uie_schema` 用于声明信息抽取目标。当前不会执行 `patterns`、`regex`、`values` 或 `model_labels` 字符串匹配；没有 `uie_schema` 的自定义规则不会触发 UIE。
+- `data.desensitized_request`：已脱敏后的大模型请求体，`messages` 内会移除 `encrypted` 和 `mapping` 控制字段。
+- `data.mapping`：原始实体到占位符的映射，调用方需要自行保存。
+- `data.stats`：本次处理消息数、替换次数、新增实体数等统计信息。
 
-成功响应示例：
+接口约定：
 
-```json
-{
-  "code": 0,
-  "message": "ok",
-  "data": {
-    "desensitized_request": {
-      "model": "gpt-4o-mini",
-      "messages": [
-        {
-          "role": "user",
-          "content": "合同甲方：[[ORG_001]]，联系人[[PERSON_001]]，手机号[[MOBILE_001]]。身份证号[[ID_CARD_001]]，银行卡号[[BANK_CARD_001]]。"
-        }
-      ]
-    },
-    "mapping": {
-      "PERSON": {
-        "张三": "[[PERSON_001]]"
-      },
-      "ORG": {
-        "上海泛微网络科技股份有限公司": "[[ORG_001]]"
-      },
-      "MOBILE": {
-        "13800138000": "[[MOBILE_001]]"
-      },
-      "ID_CARD": {
-        "110101199003071234": "[[ID_CARD_001]]"
-      },
-      "BANK_CARD": {
-        "6222020202020202020": "[[BANK_CARD_001]]"
-      }
-    },
-    "stats": {
-      "total_messages": 1,
-      "processed_messages": 1,
-      "processed_message_indexes": [0],
-      "replacements": 5,
-      "new_entities": 5
-    }
-  }
-}
-```
+- 只处理 `role=user` 的消息；`system` 和 `assistant` 消息不会被脱敏。
+- `encrypted=true` 的历史 `user` 消息表示已经脱敏，本次不会再次处理，但其中的 `mapping` 会被用于复用占位符。
+- `encrypted=false` 或缺失 `encrypted` 的 `user` 消息会参与本次脱敏。
+- 返回给上游大模型的 `data.desensitized_request.messages` 会移除 `encrypted` 和 `mapping` 控制字段。
+- `custom_entities` 当前只支持通过 `uie_schema` 声明 UIE 信息抽取目标，不执行 `patterns`、`regex`、`values` 或 `model_labels`。
+- 服务不保存 `mapping`，调用方需要在会话侧保存 `data.mapping`，并在后续历史 `user` 消息中带回。
 
-联调时可直接使用仓库内示例文件。该示例同时覆盖历史映射复用、内置 wordtag 人名/组织识别、手机号补漏，以及 UIE 身份证号/卡号/地址自定义实体：
+常见状态：
+
+- 请求体不是合法 JSON：返回 `400`。
+- `llm_request` 不是对象或 `llm_request.messages` 不是数组：返回 `400`。
+- API 服务无法连接模型服务或模型服务内部异常：返回 `500`。
+- `/readyz` 在模型未就绪或模型服务不可达时返回 `503`。
+
+联调可直接使用仓库内示例：
 
 ```powershell
 $body = Get-Content .\example_preprocess_request.json -Raw -Encoding UTF8
@@ -182,19 +183,12 @@ Invoke-RestMethod `
   -Body $body | ConvertTo-Json -Depth 20
 ```
 
-成功时，最后一条 user 消息中的敏感实体会被替换成类似：
+## 接入注意事项
 
-```text
-本次合同甲方仍是[[ORG_001]]，联系人[[PERSON_001]]，新手机号[[MOBILE_002]]。身份证号[[ID_CARD_001]]，卡号[[BANK_CARD_001]]。[[PERSON_001]]住址：[[ADDRESS_001]]
-```
+- 业务方只调用 API 服务时，不需要安装 PaddlePaddle、PaddleNLP，也不需要下载模型。
+- 模型下载、模型挂载和 UIE 预加载都由模型服务侧负责。
+- 如果身份证号、银行卡号或地址未脱敏，先检查 `/healthz` 中的 `model_service.enable_uie_custom` 和 `model_service.using_uie`。
+- 服务是无状态的，调用方必须保存 `data.mapping`，并在下一轮历史 `user` 消息中携带该映射和 `encrypted=true`。
+- 内网或离线环境需要提前准备模型文件，或为模型服务挂载包含模型文件的 Docker volume。
 
-如身份证号、银行卡号或地址未脱敏，先检查 `/healthz` 中的 `enable_uie_custom` 是否为 `true`。`using_uie` 在首次 UIE 请求前为 `false` 是正常现象。
-
-## 部署注意事项
-
-- 内网或离线环境需要提前准备 `resources/models/wordtag`，或挂载包含模型文件的 Docker volume；启动后通过 `/healthz` 确认 `using_taskflow=true`。
-- UIE 自定义实体旁路默认开启，但需要提前准备或允许首次下载 `resources/models/uie-base`；如需关闭可设置 `DESENSITIZE_ENABLE_UIE_CUSTOM=false`。
-- `resources/models/wordtag` 和 `resources/models/uie-base` 下的模型权重、缓存和推理文件较大，仓库只保留 `README.md`，不要提交实际模型文件。
-- 服务是无状态的，调用方必须保存 `data.mapping`，并在后续历史 `user` 消息中携带该映射和 `encrypted=true` 标记。
-- 返回的 `data.desensitized_request.messages` 会移除 `encrypted` 和 `mapping` 字段，可直接继续请求上游大模型。
-- 仓库文件保留/排除规则见 [仓库文件检查](docs/repository-files.md)。
+更多本地调试、模型准备和仓库瘦身规则见 [开发、部署与模型准备](docs/local-development.md)。

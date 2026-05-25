@@ -1,6 +1,1 @@
-Flask==3.1.0
-paddlepaddle==2.6.2
-paddlenlp==2.8.1
-aistudio-sdk==0.2.6
-# PaddleNLP 声明了该依赖，但上游只发布 Linux wheel；Windows 本地开发环境跳过。
-tool-helpers==0.1.2; platform_system != "Windows"
+-r requirements-model.txt

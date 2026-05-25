@@ -22,12 +22,25 @@ def create_app() -> Flask:
     config = ServiceConfig.from_env()
     service = DesensitizeService(config)
 
-    @app.get("/healthz")
-    def healthz():
-        # 返回关键运行配置，便于排查环境问题。
-        return jsonify(
+    def build_health_data() -> dict:
+        data = {
+            "status": "ok",
+            "recognizer_backend": config.recognizer_backend,
+            "model_service_url": config.model_service_url,
+            "model_service_timeout": config.model_service_timeout,
+        }
+
+        if config.recognizer_backend in {"remote", "http"}:
+            try:
+                data["model_service_status"] = "ok"
+                data["model_service"] = service.recognizer.health()
+            except Exception as exc:
+                data["model_service_status"] = "unavailable"
+                data["model_service_error"] = str(exc)
+            return data
+
+        data.update(
             {
-                "status": "ok",
                 "model_path": str(config.model_path),
                 "strict_local_model": config.strict_local_model,
                 "enable_taskflow": config.enable_taskflow,
@@ -44,6 +57,52 @@ def create_app() -> Flask:
                 "using_uie": service.recognizer.using_uie,
             }
         )
+        return data
+
+    def build_ready_data() -> tuple[dict, int]:
+        if config.recognizer_backend in {"remote", "http"}:
+            try:
+                model_ready = service.recognizer.ready()
+                return (
+                    {
+                        "status": "ready",
+                        "recognizer_backend": config.recognizer_backend,
+                        "model_service": model_ready,
+                    },
+                    200,
+                )
+            except Exception as exc:
+                return (
+                    {
+                        "status": "not_ready",
+                        "recognizer_backend": config.recognizer_backend,
+                        "model_service_error": str(exc),
+                    },
+                    503,
+                )
+
+        wordtag_ready = not config.enable_taskflow or service.recognizer.using_taskflow
+        ready = wordtag_ready
+        return (
+            {
+                "status": "ready" if ready else "not_ready",
+                "recognizer_backend": config.recognizer_backend,
+                "wordtag_ready": wordtag_ready,
+                "using_taskflow": service.recognizer.using_taskflow,
+                "using_uie": service.recognizer.using_uie,
+            },
+            200 if ready else 503,
+        )
+
+    @app.get("/healthz")
+    def healthz():
+        # 返回关键运行配置，便于排查环境问题。
+        return jsonify(build_health_data())
+
+    @app.get("/readyz")
+    def readyz():
+        ready_data, status_code = build_ready_data()
+        return jsonify(ready_data), status_code
 
     @app.post("/v1/llm/preprocess")
     def llm_preprocess():

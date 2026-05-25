@@ -14,6 +14,14 @@ def _env_to_bool(name: str, default: bool) -> bool:
     return raw in {"1", "true", "yes", "y"}
 
 
+def _env_to_tuple(name: str, default: tuple[str, ...]) -> tuple[str, ...]:
+    """把逗号分隔的环境变量解析为字符串元组。"""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return tuple(item.strip() for item in raw.split(",") if item.strip())
+
+
 @dataclass(frozen=True)
 class ServiceConfig:
     """脱敏服务运行配置。"""
@@ -34,7 +42,7 @@ class ServiceConfig:
     sync_downloaded_model: bool = True
     # PaddleNLP 默认下载缓存目录。
     downloaded_model_cache_path: Path = Path.home() / ".paddlenlp" / "taskflow" / "wordtag"
-    # 是否启用 UIE 信息抽取旁路识别业务自定义实体；默认开启，按请求懒加载。
+    # 是否启用 UIE 信息抽取旁路识别业务自定义实体。
     enable_uie_custom: bool = True
     # UIE 信息抽取模型名。
     uie_model_name: str = "uie-base"
@@ -47,6 +55,22 @@ class ServiceConfig:
     # PaddleNLP UIE 默认下载缓存目录。
     downloaded_uie_model_cache_path: Path = (
         Path.home() / ".paddlenlp" / "taskflow" / "information_extraction" / "uie-base"
+    )
+    # API 服务识别后端：默认 remote，避免业务 API 进程误加载本地模型。
+    recognizer_backend: str = "remote"
+    # 独立模型服务地址。
+    model_service_url: str = "http://127.0.0.1:18002"
+    # API 调用模型服务的超时时间。
+    model_service_timeout: float = 30.0
+    # 模型服务启动时是否预加载 UIE。
+    preload_uie_custom: bool = True
+    # UIE 预热 schema；后续请求仍可按业务传入的 uie_schema 动态更新。
+    uie_warmup_schema: tuple[str, ...] = (
+        "身份证号",
+        "卡号",
+        "银行卡号",
+        "地址",
+        "住址",
     )
 
     @classmethod
@@ -97,4 +121,25 @@ class ServiceConfig:
             uie_position_prob=float(os.getenv("DESENSITIZE_UIE_POSITION_PROB", "0.5")),
             strict_uie_model=_env_to_bool("DESENSITIZE_STRICT_UIE_MODEL", False),
             downloaded_uie_model_cache_path=downloaded_uie_model_cache_path,
+            recognizer_backend=os.getenv("DESENSITIZE_RECOGNIZER_BACKEND", "remote")
+            .strip()
+            .lower(),
+            model_service_url=os.getenv(
+                "DESENSITIZE_MODEL_SERVICE_URL",
+                "http://127.0.0.1:18002",
+            ).rstrip("/"),
+            model_service_timeout=float(
+                os.getenv("DESENSITIZE_MODEL_SERVICE_TIMEOUT", "30")
+            ),
+            preload_uie_custom=_env_to_bool("DESENSITIZE_PRELOAD_UIE_CUSTOM", True),
+            uie_warmup_schema=_env_to_tuple(
+                "DESENSITIZE_UIE_WARMUP_SCHEMA",
+                (
+                    "身份证号",
+                    "卡号",
+                    "银行卡号",
+                    "地址",
+                    "住址",
+                ),
+            ),
         )

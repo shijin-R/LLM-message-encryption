@@ -9,7 +9,9 @@
 import logging
 import re
 import shutil
+import threading
 from collections.abc import Callable, Iterator
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -100,6 +102,7 @@ class LocalEntityRecognizer:
         )
         self._uie_taskflow = None
         self._uie_schema: tuple[str, ...] = ()
+        self._uie_lock = threading.RLock()
 
         self._taskflow = self._build_taskflow()
 
@@ -419,6 +422,23 @@ class LocalEntityRecognizer:
         ]
         return self._deduplicate_spans(spans, text)
 
+    def recognize(
+        self,
+        text: str,
+        custom_entities: list[Any],
+    ) -> list[EntitySpan]:
+        """一次性执行自定义识别和内置识别，供独立模型服务减少调用次数。"""
+        return [
+            *self.recognize_custom(text, custom_entities),
+            *self.recognize_builtin(text),
+        ]
+
+    def warmup_uie(self, schema: list[str] | tuple[str, ...]) -> bool:
+        """按给定 schema 预加载 UIE 模型。"""
+        lock = getattr(self, "_uie_lock", nullcontext())
+        with lock:
+            return self._ensure_uie_taskflow(list(schema)) is not None
+
     def recognize_custom(
         self,
         text: str,
@@ -475,17 +495,19 @@ class LocalEntityRecognizer:
         schema: list[str],
     ) -> list[EntitySpan]:
         """按自定义 schema 从 UIE 输出中抽取实体。"""
-        uie_taskflow = self._ensure_uie_taskflow(schema)
-        if uie_taskflow is None:
-            return []
+        lock = getattr(self, "_uie_lock", nullcontext())
+        with lock:
+            uie_taskflow = self._ensure_uie_taskflow(schema)
+            if uie_taskflow is None:
+                return []
 
-        try:
-            tagged = uie_taskflow(text)
-        except Exception as exc:
-            if self.strict_uie_model:
-                raise RuntimeError("Taskflow UIE inference failed.") from exc
-            logger.warning("Taskflow UIE inference failed, skip UIE extraction: %s", exc)
-            return []
+            try:
+                tagged = uie_taskflow(text)
+            except Exception as exc:
+                if self.strict_uie_model:
+                    raise RuntimeError("Taskflow UIE inference failed.") from exc
+                logger.warning("Taskflow UIE inference failed, skip UIE extraction: %s", exc)
+                return []
 
         return list(self._iter_uie_spans(text, tagged, rules))
 
