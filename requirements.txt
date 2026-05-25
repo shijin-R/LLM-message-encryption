@@ -1,5 +1,4 @@
 Flask==3.1.0
-jieba==0.42.1
 paddlepaddle==2.6.2
 paddlenlp==2.8.1
 aistudio-sdk==0.2.6

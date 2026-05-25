@@ -29,6 +29,9 @@ run_service.*.log
 resources/models/wordtag/*
 !resources/models/wordtag/
 !resources/models/wordtag/README.md
+resources/models/uie-base/*
+!resources/models/uie-base/
+!resources/models/uie-base/README.md
 
 # Local demo / smoke-test script, not required in the maintained repo.
 run_and_test.ps1

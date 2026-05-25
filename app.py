@@ -31,11 +31,17 @@ def create_app() -> Flask:
                 "model_path": str(config.model_path),
                 "strict_local_model": config.strict_local_model,
                 "enable_taskflow": config.enable_taskflow,
-                "enable_jieba_fallback": config.enable_jieba_fallback,
                 "auto_download_model": config.auto_download_model,
                 "sync_downloaded_model": config.sync_downloaded_model,
                 "model_cache_path": str(config.downloaded_model_cache_path),
                 "using_taskflow": service.recognizer.using_taskflow,
+                "enable_uie_custom": config.enable_uie_custom,
+                "uie_model_name": config.uie_model_name,
+                "uie_model_path": str(config.uie_model_path),
+                "uie_position_prob": config.uie_position_prob,
+                "strict_uie_model": config.strict_uie_model,
+                "uie_model_cache_path": str(config.downloaded_uie_model_cache_path),
+                "using_uie": service.recognizer.using_uie,
             }
         )
 

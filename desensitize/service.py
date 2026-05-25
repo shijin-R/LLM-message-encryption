@@ -16,22 +16,25 @@ class DesensitizeService:
         "custom": 4,
         "model": 3,
         "regex": 3,
-        "jieba": 2,
     }
 
     def __init__(self, config: ServiceConfig) -> None:
         self.config = config
         self.recognizer = LocalEntityRecognizer(
             model_path=config.model_path,
-            dict_dir=config.dict_dir,
             device_id=config.device_id,
             max_text_len=config.max_text_len,
             enable_taskflow=config.enable_taskflow,
-            enable_jieba_fallback=config.enable_jieba_fallback,
             strict_local_model=config.strict_local_model,
             auto_download_model=config.auto_download_model,
             sync_downloaded_model=config.sync_downloaded_model,
             downloaded_model_cache_path=config.downloaded_model_cache_path,
+            enable_uie_custom=config.enable_uie_custom,
+            uie_model_name=config.uie_model_name,
+            uie_model_path=config.uie_model_path,
+            uie_position_prob=config.uie_position_prob,
+            strict_uie_model=config.strict_uie_model,
+            downloaded_uie_model_cache_path=config.downloaded_uie_model_cache_path,
         )
 
     def _desensitize_messages(
@@ -174,8 +177,8 @@ class DesensitizeService:
         custom_entities: list[Any],
     ) -> tuple[str, int]:
         """对单条文本执行实体抽取、冲突消解和占位符替换。"""
-        # 三路实体来源：已有映射、自定义模型规则、内置识别。
-        # 已有映射用于保证占位符复用；内置识别里 Taskflow wordtag 是主识别链路。
+        # 三路实体来源：已有映射、自定义 UIE 识别、内置识别。
+        # 已有映射用于保证占位符复用；内置识别由 wordtag 和手机号规则组成。
         mapping_spans = self._extract_mapping_spans(text, mapping_store.mapping)
         custom_spans = self.recognizer.recognize_custom(text, custom_entities)
         builtin_spans = self.recognizer.recognize_builtin(text)

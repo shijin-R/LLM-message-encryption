@@ -6,9 +6,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     HOST=0.0.0.0 \
     PORT=18001 \
     DESENSITIZE_MODEL_PATH=/app/resources/models/wordtag \
-    DESENSITIZE_DICT_DIR=/app/resources/common_data/uie \
+    DESENSITIZE_UIE_MODEL_PATH=/app/resources/models/uie-base \
     DESENSITIZE_AUTO_DOWNLOAD_MODEL=true \
-    DESENSITIZE_SYNC_DOWNLOADED_MODEL=true
+    DESENSITIZE_SYNC_DOWNLOADED_MODEL=true \
+    DESENSITIZE_ENABLE_UIE_CUSTOM=true
 
 WORKDIR /app
 
@@ -22,14 +23,13 @@ RUN python -m pip install --no-cache-dir -r requirements.txt
 
 COPY app.py .
 COPY desensitize ./desensitize
-COPY resources/common_data ./resources/common_data
 COPY resources/models/wordtag/README.md ./resources/models/wordtag/README.md
+COPY resources/models/uie-base/README.md ./resources/models/uie-base/README.md
 COPY example_preprocess_request.json .
-COPY example_history_reuse_request.json .
 COPY README.md .
 
 # 模型文件较大，默认用 volume 持久化，避免每次重建镜像都重新内置模型。
-VOLUME ["/app/resources/models/wordtag"]
+VOLUME ["/app/resources/models/wordtag", "/app/resources/models/uie-base"]
 
 EXPOSE 18001
 

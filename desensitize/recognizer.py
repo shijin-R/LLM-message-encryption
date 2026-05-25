@@ -2,7 +2,7 @@
 
 组合多路识别能力：
 1) PaddleNLP Taskflow NER 的 wordtag 模型（优先）
-2) 可选 jieba 词性识别补漏
+2) 可选 PaddleNLP Taskflow information_extraction 的 UIE 模型旁路识别自定义实体
 3) 手机号正则抽取
 """
 
@@ -24,30 +24,11 @@ class LocalEntityRecognizer:
     # PaddleNLP 2.8.x 没有 Taskflow("wordtag") 这个顶层任务名。
     # 正确入口是 Taskflow("ner")，其 accurate 模式内部使用 wordtag 模型。
     TASKFLOW_TASK = "ner"
+    UIE_TASKFLOW_TASK = "information_extraction"
     TASKFLOW_ENTITY_SOURCE = "model"
 
     MOBILE_PATTERN = re.compile(r"(?<!\d)1[3-9]\d{9}(?!\d)")
     CHINESE_PATTERN = re.compile(r"[\u4e00-\u9fff]")
-    CUSTOM_ENTITY_LABEL_ALIASES = {
-        "PERSON": {"person", "姓名", "人名", "人物", "姓氏"},
-        "ORG": {"org", "organization", "组织", "机构", "公司", "企业", "品牌"},
-        "MOBILE": {"mobile", "phone", "手机号", "手机号码", "电话"},
-        "ADDRESS": {
-            "address",
-            "住址",
-            "地址",
-            "场所",
-            "场所类",
-            "交通场所",
-            "网上场所",
-            "世界地区",
-            "世界地区类",
-            "地理概念",
-            "区划概念",
-            "位置方位",
-        },
-    }
-
     PERSON_BAD_CASE = {
         "谢谢",
         "人名",
@@ -72,23 +53,25 @@ class LocalEntityRecognizer:
     def __init__(
         self,
         model_path: Path,
-        dict_dir: Path,
         device_id: int = 0,
         max_text_len: int = 10000,
         enable_taskflow: bool = True,
-        enable_jieba_fallback: bool = False,
         strict_local_model: bool = True,
         auto_download_model: bool = True,
         sync_downloaded_model: bool = True,
         downloaded_model_cache_path: Path | None = None,
+        enable_uie_custom: bool = True,
+        uie_model_name: str = "uie-base",
+        uie_model_path: Path | None = None,
+        uie_position_prob: float = 0.5,
+        strict_uie_model: bool = False,
+        downloaded_uie_model_cache_path: Path | None = None,
     ) -> None:
         # 初始化识别器配置。
         self.model_path = Path(model_path)
-        self.dict_dir = Path(dict_dir)
         self.device_id = device_id
         self.max_text_len = max_text_len
         self.enable_taskflow = enable_taskflow
-        self.enable_jieba_fallback = enable_jieba_fallback
         self.strict_local_model = strict_local_model
         self.auto_download_model = auto_download_model
         self.sync_downloaded_model = sync_downloaded_model
@@ -97,9 +80,27 @@ class LocalEntityRecognizer:
             if downloaded_model_cache_path is not None
             else Path.home() / ".paddlenlp" / "taskflow" / "wordtag"
         )
+        self.enable_uie_custom = enable_uie_custom
+        self.uie_model_name = uie_model_name
+        self.uie_model_path = (
+            Path(uie_model_path)
+            if uie_model_path is not None
+            else self.model_path.parent / uie_model_name
+        )
+        self.uie_position_prob = uie_position_prob
+        self.strict_uie_model = strict_uie_model
+        self.downloaded_uie_model_cache_path = (
+            Path(downloaded_uie_model_cache_path)
+            if downloaded_uie_model_cache_path is not None
+            else Path.home()
+            / ".paddlenlp"
+            / "taskflow"
+            / "information_extraction"
+            / uie_model_name
+        )
+        self._uie_taskflow = None
+        self._uie_schema: tuple[str, ...] = ()
 
-        if self.enable_jieba_fallback:
-            self._load_jieba_dicts()
         self._taskflow = self._build_taskflow()
 
     @property
@@ -107,26 +108,18 @@ class LocalEntityRecognizer:
         """当前请求识别链路是否已启用 Taskflow wordtag。"""
         return self._taskflow is not None
 
-    def _load_jieba_dicts(self) -> None:
-        """加载本地词典，提升 jieba 对业务词的人名/机构识别效果。"""
-        import jieba
+    @property
+    def using_uie(self) -> bool:
+        """当前进程是否已懒加载 UIE 信息抽取旁路。"""
+        return self._uie_taskflow is not None
 
-        name_dict = self.dict_dir / "name.txt"
-        user_dict = self.dict_dir / "user.txt"
-
-        if name_dict.exists():
-            with name_dict.open(encoding="utf-8") as file:
-                jieba.load_userdict(file)
-        if user_dict.exists():
-            with user_dict.open(encoding="utf-8") as file:
-                jieba.load_userdict(file)
-
-    def _has_local_model_files(self) -> bool:
+    def _has_local_model_files(self, model_path: Path | None = None) -> bool:
         """判断本地模型目录是否存在可用模型文件。"""
-        if not self.model_path.exists() or not self.model_path.is_dir():
+        target_path = self.model_path if model_path is None else Path(model_path)
+        if not target_path.exists() or not target_path.is_dir():
             return False
 
-        for item in self.model_path.rglob("*"):
+        for item in target_path.rglob("*"):
             if item.is_file() and item.name.lower() not in {"readme.md", ".gitkeep"}:
                 return True
         return False
@@ -134,7 +127,7 @@ class LocalEntityRecognizer:
     def _build_taskflow(self):
         """按配置创建 Taskflow 推理实例，不可用时自动降级。"""
         if not self.enable_taskflow:
-            logger.info("Taskflow wordtag is disabled; fallback to regex and optional jieba")
+            logger.info("Taskflow wordtag is disabled; fallback to mobile regex")
             return None
 
         try:
@@ -145,7 +138,7 @@ class LocalEntityRecognizer:
                     "paddlenlp is required. Please install dependencies from requirements.txt"
                 ) from exc
             logger.warning(
-                "paddlenlp is not available, fallback to regex and optional jieba: %s",
+                "paddlenlp is not available, fallback to mobile regex: %s",
                 exc,
             )
             return None
@@ -181,7 +174,7 @@ class LocalEntityRecognizer:
             )
 
         logger.warning(
-            "Local model is unavailable; fallback to regex and optional jieba. "
+            "Local model is unavailable; fallback to mobile regex. "
             "model_path=%s auto_download_model=%s",
             self.model_path,
             self.auto_download_model,
@@ -231,20 +224,172 @@ class LocalEntityRecognizer:
             **kwargs,
         )
 
+    def _ensure_uie_taskflow(self, schema: list[str]):
+        """按 schema 懒加载或更新 UIE 信息抽取模型。"""
+        if not getattr(self, "enable_uie_custom", False):
+            return None
+
+        normalized_schema = tuple(
+            dict.fromkeys(label.strip() for label in schema if label and label.strip())
+        )
+        if not normalized_schema:
+            return None
+
+        if self._uie_taskflow is None:
+            self._uie_taskflow = self._build_uie_taskflow(list(normalized_schema))
+            self._uie_schema = normalized_schema if self._uie_taskflow is not None else ()
+            return self._uie_taskflow
+
+        if self._uie_schema != normalized_schema:
+            try:
+                self._uie_taskflow.set_schema(list(normalized_schema))
+                self._uie_schema = normalized_schema
+            except Exception as exc:
+                if self.strict_uie_model:
+                    raise RuntimeError("Failed to update UIE schema.") from exc
+                logger.warning("Failed to update UIE schema, skip UIE extraction: %s", exc)
+                return None
+
+        return self._uie_taskflow
+
+    def _build_uie_taskflow(self, schema: list[str]):
+        """按配置创建 Taskflow information_extraction UIE 推理实例。"""
+        try:
+            from paddlenlp import Taskflow
+        except ImportError as exc:
+            if self.strict_uie_model:
+                raise RuntimeError(
+                    "paddlenlp is required for UIE information extraction."
+                ) from exc
+            logger.warning("paddlenlp is not available, skip UIE extraction: %s", exc)
+            return None
+
+        if self._has_local_model_files(self.uie_model_path):
+            local_taskflow = self._init_local_uie_taskflow(
+                Taskflow,
+                schema=schema,
+                raise_on_error=self.strict_uie_model,
+            )
+            if local_taskflow is not None:
+                return local_taskflow
+
+        if self.auto_download_model:
+            downloaded_taskflow = self._init_default_uie_taskflow(
+                Taskflow,
+                schema=schema,
+                raise_on_error=self.strict_uie_model,
+            )
+            if downloaded_taskflow is not None:
+                self._sync_downloaded_uie_model_to_local()
+
+                if self._has_local_model_files(self.uie_model_path):
+                    local_taskflow = self._init_local_uie_taskflow(
+                        Taskflow,
+                        schema=schema,
+                        raise_on_error=False,
+                    )
+                    if local_taskflow is not None:
+                        return local_taskflow
+                return downloaded_taskflow
+
+        if self.strict_uie_model:
+            raise FileNotFoundError(
+                "Local UIE model is unavailable and auto-download failed/disabled. "
+                f"uie_model_path={self.uie_model_path}, "
+                f"uie_model_name={self.uie_model_name}, "
+                f"auto_download_model={self.auto_download_model}."
+            )
+
+        logger.warning(
+            "UIE model is unavailable; skip custom UIE extraction. "
+            "uie_model_path=%s uie_model_name=%s auto_download_model=%s",
+            self.uie_model_path,
+            self.uie_model_name,
+            self.auto_download_model,
+        )
+        return None
+
+    def _init_local_uie_taskflow(self, taskflow_cls, schema: list[str], raise_on_error: bool):
+        """从本地目录初始化 Taskflow information_extraction UIE。"""
+        try:
+            self.uie_model_path.mkdir(parents=True, exist_ok=True)
+            return self._create_uie_taskflow(
+                taskflow_cls,
+                schema=schema,
+                task_path=self.uie_model_path.as_posix(),
+            )
+        except Exception as exc:
+            if raise_on_error:
+                raise RuntimeError(
+                    "Failed to initialize local Taskflow UIE model at "
+                    f"{self.uie_model_path}."
+                ) from exc
+            logger.warning("Failed to initialize local UIE, fallback to default: %s", exc)
+            return None
+
+    def _init_default_uie_taskflow(self, taskflow_cls, schema: list[str], raise_on_error: bool):
+        """初始化默认 Taskflow information_extraction UIE（可能触发模型下载）。"""
+        try:
+            return self._create_uie_taskflow(taskflow_cls, schema=schema)
+        except Exception as exc:
+            if raise_on_error:
+                raise RuntimeError(
+                    "Failed to initialize default Taskflow UIE auto-download."
+                ) from exc
+            logger.warning("Failed to auto-download default UIE model: %s", exc)
+            return None
+
+    def _create_uie_taskflow(self, taskflow_cls, schema: list[str], **kwargs):
+        """创建 PaddleNLP UIE 信息抽取器。"""
+        return taskflow_cls(
+            self.UIE_TASKFLOW_TASK,
+            schema=schema,
+            model=self.uie_model_name,
+            device_id=self.device_id,
+            position_prob=self.uie_position_prob,
+            **kwargs,
+        )
+
     def _sync_downloaded_model_to_local(self) -> None:
         """把自动下载的模型同步到项目本地模型目录。"""
         if not self.sync_downloaded_model:
             return
 
         source_dir = self.downloaded_model_cache_path
+        self._sync_model_directory(source_dir, self.model_path)
+
+    def _sync_downloaded_uie_model_to_local(self) -> None:
+        """把自动下载的 UIE 模型同步到项目本地模型目录。"""
+        if not self.sync_downloaded_model:
+            return
+
+        source_dir = self._find_downloaded_uie_model_cache_path()
+        self._sync_model_directory(source_dir, self.uie_model_path)
+
+    def _find_downloaded_uie_model_cache_path(self) -> Path:
+        """兼容 PaddleNLP 不同版本可能使用的 UIE 缓存目录名。"""
+        taskflow_root = Path.home() / ".paddlenlp" / "taskflow"
+        candidates = [
+            self.downloaded_uie_model_cache_path,
+            taskflow_root / "information_extraction" / self.uie_model_name,
+            taskflow_root / f"information_extraction-{self.uie_model_name}",
+            taskflow_root / self.uie_model_name,
+        ]
+        for candidate in candidates:
+            if candidate.exists() and candidate.is_dir():
+                return candidate
+        return candidates[0]
+
+    def _sync_model_directory(self, source_dir: Path, target_dir: Path) -> None:
+        """把 PaddleNLP 缓存目录同步到项目模型目录。"""
         if not source_dir.exists() or not source_dir.is_dir():
             logger.warning("Auto-downloaded model cache path not found: %s", source_dir)
             return
 
         try:
-            self.model_path.mkdir(parents=True, exist_ok=True)
+            target_dir.mkdir(parents=True, exist_ok=True)
             for item in source_dir.iterdir():
-                target = self.model_path / item.name
+                target = target_dir / item.name
                 if item.is_dir():
                     shutil.copytree(item, target, dirs_exist_ok=True)
                 elif item.is_file():
@@ -252,13 +397,13 @@ class LocalEntityRecognizer:
             logger.info(
                 "Synced auto-downloaded model from %s to %s",
                 source_dir,
-                self.model_path,
+                target_dir,
             )
         except Exception as exc:
             logger.warning(
                 "Failed to sync auto-downloaded model from %s to %s: %s",
                 source_dir,
-                self.model_path,
+                target_dir,
                 exc,
             )
 
@@ -267,13 +412,11 @@ class LocalEntityRecognizer:
         if not text or len(text) > self.max_text_len:
             return []
 
-        # Taskflow wordtag 为主，手机号正则补漏；jieba 仅在显式开启时兜底。
+        # Taskflow wordtag 为主，手机号正则补漏。
         spans = [
             *self._extract_with_taskflow(text),
             *self._extract_mobile(text),
         ]
-        if self.enable_jieba_fallback:
-            spans.extend(self._extract_with_jieba(text))
         return self._deduplicate_spans(spans, text)
 
     def recognize_custom(
@@ -281,22 +424,22 @@ class LocalEntityRecognizer:
         text: str,
         custom_entities: list[Any],
     ) -> list[EntitySpan]:
-        """使用本地 Taskflow 模型识别业务方声明的自定义实体。
+        """使用 UIE 信息抽取模型识别业务方声明的自定义实体。
 
         这里不会执行业务方传入的 regex/pattern/value 字符串匹配；自定义实体只通过
-        本地模型返回的标签命中。`model_labels`、`labels` 或 `schema` 可用于声明要
-        匹配的模型标签；未提供时会根据 `entity_type` 使用内置别名兜底。
+        UIE 模型返回结果命中。`uie_schema` 用于声明 UIE 信息抽取目标；
+        未提供 UIE schema 时不会触发自定义实体识别。
         """
         if not text or len(text) > self.max_text_len:
             return []
         if not isinstance(custom_entities, list):
             return []
 
-        rules = self._normalize_custom_model_rules(custom_entities)
-        if not rules or self._taskflow is None:
+        uie_rules, uie_schema = self._normalize_custom_uie_rules(custom_entities)
+        if not uie_rules:
             return []
 
-        spans = self._extract_custom_with_taskflow(text, rules)
+        spans = self._extract_custom_with_uie(text, uie_rules, uie_schema)
         spans = self._merge_adjacent_custom_spans(spans, text)
         return self._deduplicate_spans(spans, text)
 
@@ -325,49 +468,101 @@ class LocalEntityRecognizer:
         """兼容 BIOES 标签序列输出。"""
         return self._extract_bioes_spans(text, pairs, self._make_model_span)
 
-    def _extract_custom_with_taskflow(
+    def _extract_custom_with_uie(
         self,
         text: str,
         rules: list[tuple[str, set[str]]],
+        schema: list[str],
     ) -> list[EntitySpan]:
-        """按自定义标签规则从 Taskflow 输出中抽取实体。"""
-        pairs = self._extract_taskflow_pairs(text)
-        if not pairs:
+        """按自定义 schema 从 UIE 输出中抽取实体。"""
+        uie_taskflow = self._ensure_uie_taskflow(schema)
+        if uie_taskflow is None:
             return []
 
-        if any(self._split_bioes_tag(tag)[0] for _, tag in pairs):
-            return self._extract_bioes_custom_taskflow_spans(text, pairs, rules)
+        try:
+            tagged = uie_taskflow(text)
+        except Exception as exc:
+            if self.strict_uie_model:
+                raise RuntimeError("Taskflow UIE inference failed.") from exc
+            logger.warning("Taskflow UIE inference failed, skip UIE extraction: %s", exc)
+            return []
 
-        spans: list[EntitySpan] = []
+        return list(self._iter_uie_spans(text, tagged, rules))
 
-        for token, tag, start, end in self._iter_located_tokens(text, pairs):
-            entity_type = self._match_custom_entity_type(tag, rules)
-            if (
-                entity_type
-                and self._looks_valid_entity(entity_type, token)
-            ):
-                spans.append(EntitySpan(entity_type, token, start, end, "custom"))
-
-        return spans
-
-    def _extract_bioes_custom_taskflow_spans(
+    def _iter_uie_spans(
         self,
         text: str,
-        pairs: list[tuple[str, str]],
+        tagged: Any,
         rules: list[tuple[str, set[str]]],
-    ) -> list[EntitySpan]:
-        """兼容 BIOES 标签序列的自定义实体抽取。"""
-        return self._extract_bioes_spans(
-            text,
-            pairs,
-            lambda label, token, start, end: self._make_custom_span(
-                label,
-                token,
-                start,
-                end,
-                rules,
-            ),
-        )
+    ) -> Iterator[EntitySpan]:
+        """把 UIE 输出结构转换为 EntitySpan。"""
+        cursor_by_text: dict[str, int] = {}
+
+        for label, item in self._iter_uie_items(tagged):
+            entity_type = self._match_custom_entity_type(label, rules)
+            if not entity_type:
+                continue
+
+            token = item.get("text") if isinstance(item, dict) else None
+            if token is None:
+                continue
+            token = str(token)
+            if not self._looks_valid_entity(entity_type, token):
+                continue
+
+            start, end = self._get_uie_item_span(text, item, token, cursor_by_text)
+            if start < 0 or end <= start:
+                continue
+            yield EntitySpan(entity_type, token, start, end, "custom")
+
+    @classmethod
+    def _iter_uie_items(cls, tagged: Any) -> Iterator[tuple[str, dict[str, Any]]]:
+        """遍历 UIE 顶层实体和 relations 中的实体。"""
+        if isinstance(tagged, list):
+            for item in tagged:
+                yield from cls._iter_uie_items(item)
+            return
+
+        if not isinstance(tagged, dict):
+            return
+
+        for label, value in tagged.items():
+            if label == "relations":
+                if isinstance(value, dict):
+                    yield from cls._iter_uie_items(value)
+                continue
+
+            if not isinstance(value, list):
+                continue
+
+            for item in value:
+                if not isinstance(item, dict):
+                    continue
+                yield str(label), item
+                relations = item.get("relations")
+                if isinstance(relations, dict):
+                    yield from cls._iter_uie_items(relations)
+
+    def _get_uie_item_span(
+        self,
+        text: str,
+        item: dict[str, Any],
+        token: str,
+        cursor_by_text: dict[str, int],
+    ) -> tuple[int, int]:
+        """优先使用 UIE 返回的 start/end，缺失时退回文本定位。"""
+        raw_start = item.get("start")
+        raw_end = item.get("end")
+        if isinstance(raw_start, int) and isinstance(raw_end, int):
+            return raw_start, raw_end
+
+        cursor = cursor_by_text.get(token, 0)
+        start = self._find_token(text, token, cursor)
+        if start < 0:
+            return -1, -1
+        end = start + len(token)
+        cursor_by_text[token] = end
+        return start, end
 
     def _extract_bioes_spans(
         self,
@@ -430,36 +625,49 @@ class LocalEntityRecognizer:
         flush_active()
         return spans
 
-    def _normalize_custom_model_rules(
+    def _normalize_custom_uie_rules(
         self,
         custom_entities: list[Any],
-    ) -> list[tuple[str, set[str]]]:
-        """把 custom_entities 转成模型标签匹配规则。"""
+    ) -> tuple[list[tuple[str, set[str]]], list[str]]:
+        """把 custom_entities 转成 UIE schema 和输出标签匹配规则。"""
+        if not getattr(self, "enable_uie_custom", False):
+            return [], []
+
         rules: list[tuple[str, set[str]]] = []
+        schema: list[str] = []
+        seen_schema: set[str] = set()
+
         for rule in custom_entities:
             if not isinstance(rule, dict):
                 continue
 
             raw_entity_type = rule.get("entity_type", rule.get("type", "CUSTOM"))
             entity_type = normalize_entity_type(raw_entity_type)
-            labels = {
-                self._normalize_label(label)
-                for label in self._iter_label_values(
-                    rule.get("model_labels")
-                    or rule.get("labels")
-                    or rule.get("label")
-                    or rule.get("schema")
+            raw_labels = list(
+                self._iter_label_values(
+                    rule.get("uie_schema")
+                    or rule.get("uie_labels")
+                    or rule.get("uie_label")
                 )
-            }
+            )
+            if not raw_labels:
+                continue
+
+            labels = {self._normalize_label(label) for label in raw_labels}
             labels = {label for label in labels if label}
             if not labels:
-                labels.add(self._normalize_label(raw_entity_type))
+                continue
 
-            labels.update(self.CUSTOM_ENTITY_LABEL_ALIASES.get(entity_type, set()))
-            labels = {label for label in labels if label}
-            if labels:
-                rules.append((entity_type, labels))
-        return rules
+            for label in raw_labels:
+                clean_label = str(label or "").strip()
+                if not clean_label or clean_label in seen_schema:
+                    continue
+                seen_schema.add(clean_label)
+                schema.append(clean_label)
+
+            rules.append((entity_type, labels))
+
+        return rules, schema
 
     @classmethod
     def _match_custom_entity_type(
@@ -504,19 +712,6 @@ class LocalEntityRecognizer:
             return EntitySpan("ORG", token, start, end, self.TASKFLOW_ENTITY_SOURCE)
         if self._is_person_tag(tag) and self._looks_valid_person(token):
             return EntitySpan("PERSON", token, start, end, self.TASKFLOW_ENTITY_SOURCE)
-        return None
-
-    def _make_custom_span(
-        self,
-        tag: str,
-        token: str,
-        start: int,
-        end: int,
-        rules: list[tuple[str, set[str]]],
-    ) -> EntitySpan | None:
-        entity_type = self._match_custom_entity_type(tag, rules)
-        if entity_type and self._looks_valid_entity(entity_type, token):
-            return EntitySpan(entity_type, token, start, end, "custom")
         return None
 
     def _extract_taskflow_pairs(self, text: str) -> list[tuple[str, str]]:
@@ -641,31 +836,6 @@ class LocalEntityRecognizer:
             if isinstance(item, (list, tuple)) and len(item) >= 2:
                 yield str(item[0]), str(item[1])
 
-    def _extract_with_jieba(self, text: str) -> list[EntitySpan]:
-        """使用 jieba 词性标注抽取人名/机构。"""
-        from jieba import posseg
-
-        spans: list[EntitySpan] = []
-        cursor = 0
-
-        for seg in posseg.lcut(text):
-            raw_word = seg.word
-            flag = seg.flag
-
-            start = cursor
-            end = cursor + len(raw_word)
-            cursor = end
-
-            if end > len(text):
-                break
-
-            if flag in {"nr", "nrt"} and self._looks_valid_person(raw_word):
-                spans.append(EntitySpan("PERSON", raw_word, start, end, "jieba"))
-            elif flag in {"nt"} and self._looks_valid_org(raw_word):
-                spans.append(EntitySpan("ORG", raw_word, start, end, "jieba"))
-
-        return spans
-
     def _extract_mobile(self, text: str) -> list[EntitySpan]:
         """使用正则抽取手机号。"""
         spans: list[EntitySpan] = []
@@ -722,7 +892,7 @@ class LocalEntityRecognizer:
         return True
 
     def _looks_valid_entity(self, entity_type: str, token: str) -> bool:
-        """按实体类型复用内置候选过滤，避免自定义模型规则放大噪声。"""
+        """按实体类型复用内置候选过滤，避免自定义 UIE 候选放大噪声。"""
         normalized_type = normalize_entity_type(entity_type)
         if normalized_type == "PERSON":
             return self._looks_valid_person(token)

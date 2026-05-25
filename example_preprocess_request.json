@@ -5,7 +5,7 @@
     "messages": [
       {
         "role": "system",
-        "content": "你是合同助手"
+        "content": "你是客户资料助手"
       },
       {
         "role": "user",
@@ -29,27 +29,23 @@
       },
       {
         "role": "user",
-        "content": "本次合同甲方仍是上海泛微网络科技股份有限公司，联系人张三，手机号13800138000。住址：北京市海淀区中关村大街27号。张三有高血压",
+        "content": "本次合同甲方仍是上海泛微网络科技股份有限公司，联系人张三，新手机号15800158000。身份证号110101199003071234，卡号6222020202020202020。张三住址：中关村大街15号",
         "encrypted": false
       }
     ]
   },
   "custom_entities": [
     {
-      "entity_type": "PERSON",
-      "model_labels": ["人名", "姓名"]
+      "entity_type": "ID_CARD",
+      "uie_schema": ["身份证号"]
     },
     {
-      "entity_type": "ORG",
-      "model_labels": ["机构", "公司", "组织"]
+      "entity_type": "BANK_CARD",
+      "uie_schema": ["卡号", "银行卡号"]
     },
     {
       "entity_type": "ADDRESS",
-      "model_labels": [ "住址", "地址"]
-    },
-    {
-      "entity_type": "DISEASE",
-      "model_labels": [ "疾病", "病症"]
+      "uie_schema": ["地址", "住址"]
     }
   ]
 }
