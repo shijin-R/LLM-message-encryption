@@ -4,7 +4,7 @@
 
 本项目提供一个独立的 HTTP 前置服务，用于在业务请求发送给大模型前，对 `llm_request.messages` 中未标记为已脱敏的 `user` 消息执行敏感实体替换，并返回可继续转发给上游模型的请求体。
 
-服务会将姓名、组织/公司、手机号等实体替换为结构化占位符，例如 `[[PERSON_001]]`、`[[ORG_001]]`、`[[MOBILE_001]]`。调用方需要保存接口返回的 `mapping`，并在下一轮请求的历史 `user` 消息中带回，以复用同一套占位符。
+服务会将姓名、组织/公司、手机号，以及通过 UIE 声明的身份证号、银行卡号、地址等实体替换为结构化占位符，例如 `[[PERSON_001]]`、`[[ORG_001]]`、`[[MOBILE_001]]`。调用方需要保存接口返回的 `mapping`，并在下一轮请求的历史 `user` 消息中带回，以复用同一套占位符。
 
 本服务不保存会话状态，不持久化映射字典，不转发大模型请求，也不提供大模型响应还原接口。实体识别、本地调试和模型准备细节见 [本地开发与模型准备](docs/local-development.md)。
 
@@ -54,6 +54,20 @@ http://127.0.0.1:18001
 ```powershell
 Invoke-RestMethod "http://127.0.0.1:18001/healthz" | ConvertTo-Json -Depth 10
 ```
+
+重点关注字段示例：
+
+```json
+{
+  "status": "ok",
+  "using_taskflow": true,
+  "enable_uie_custom": true,
+  "using_uie": false,
+  "uie_model_path": "resources/models/uie-base"
+}
+```
+
+`using_uie=false` 不代表 UIE 未开启；服务刚启动且尚未处理带 `uie_schema` 的请求时，UIE 会保持未加载状态。
 
 Docker 启动：
 
@@ -156,7 +170,7 @@ POST /v1/llm/preprocess
 }
 ```
 
-联调时可直接使用仓库内示例文件。该示例同时覆盖历史映射复用、内置 wordtag 人名/组织识别、手机号补漏，以及 UIE 身份证号/卡号自定义实体：
+联调时可直接使用仓库内示例文件。该示例同时覆盖历史映射复用、内置 wordtag 人名/组织识别、手机号补漏，以及 UIE 身份证号/卡号/地址自定义实体：
 
 ```powershell
 $body = Get-Content .\example_preprocess_request.json -Raw -Encoding UTF8
@@ -171,10 +185,10 @@ Invoke-RestMethod `
 成功时，最后一条 user 消息中的敏感实体会被替换成类似：
 
 ```text
-本次合同甲方仍是[[ORG_001]]，联系人[[PERSON_001]]，新手机号[[MOBILE_002]]。身份证号[[ID_CARD_001]]，卡号[[BANK_CARD_001]]。
+本次合同甲方仍是[[ORG_001]]，联系人[[PERSON_001]]，新手机号[[MOBILE_002]]。身份证号[[ID_CARD_001]]，卡号[[BANK_CARD_001]]。[[PERSON_001]]住址：[[ADDRESS_001]]
 ```
 
-如身份证号或银行卡号未脱敏，先检查 `/healthz` 中的 `enable_uie_custom` 是否为 `true`。`using_uie` 在首次 UIE 请求前为 `false` 是正常现象。
+如身份证号、银行卡号或地址未脱敏，先检查 `/healthz` 中的 `enable_uie_custom` 是否为 `true`。`using_uie` 在首次 UIE 请求前为 `false` 是正常现象。
 
 ## 部署注意事项
 
