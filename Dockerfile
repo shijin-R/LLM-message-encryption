@@ -27,7 +27,6 @@ LABEL org.opencontainers.image.title="llm-messages-encryptor-api" \
 # API 镜像只安装 HTTP 服务依赖；业务方启动 API 时不需要模型文件和 Paddle 依赖。
 ENV HOST=0.0.0.0 \
     PORT=18001 \
-    DESENSITIZE_RECOGNIZER_BACKEND=remote \
     DESENSITIZE_MODEL_SERVICE_URL=http://llm-messages-encryptor-model:18002 \
     HEALTHCHECK_PATH=/readyz
 

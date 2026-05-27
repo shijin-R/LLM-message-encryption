@@ -8,8 +8,8 @@ from flask import Flask, jsonify, request
 from werkzeug.exceptions import HTTPException
 
 from desensitize.config import ServiceConfig
-from desensitize.recognizer_factory import build_local_recognizer
-from desensitize.types import EntitySpan
+from desensitize.recognizer_factory import build_model_recognizer
+from desensitize.types import ModelSpan
 
 
 logging.basicConfig(
@@ -18,14 +18,17 @@ logging.basicConfig(
 )
 
 
-def create_model_app() -> Flask:
+def create_model_app(
+    config: ServiceConfig | None = None,
+    recognizer: Any | None = None,
+) -> Flask:
     """创建并配置独立模型服务。"""
     app = Flask(__name__)
 
     # 模型服务始终使用本地识别器：这里会按配置加载 wordtag / UIE 模型，
-    # 对 API 服务暴露一个轻量 HTTP 识别后端。
-    config = ServiceConfig.from_env()
-    recognizer = build_local_recognizer(config)
+    # 对 API 服务暴露一个轻量纯推理 HTTP 后端。
+    config = ServiceConfig.from_env() if config is None else config
+    recognizer = build_model_recognizer(config) if recognizer is None else recognizer
 
     # 生产部署下可在启动阶段预热 UIE，避免首个带 uie_schema 的请求承受加载耗时。
     if config.enable_uie_custom and config.preload_uie_custom:
@@ -81,31 +84,13 @@ def create_model_app() -> Flask:
             status_code,
         )
 
-    @app.post("/v1/recognize")
-    def recognize_all():
-        # 组合识别接口：一次请求同时执行自定义 UIE 识别和内置识别，
-        # 供 API 服务减少 HTTP 往返。
+    @app.post("/v1/infer")
+    def infer():
+        # 组合推理接口：只接收模型推理所需参数，不解释业务 custom_entities。
         payload = _get_json_payload()
         text = _get_text(payload)
-        custom_entities = _get_custom_entities(payload)
-        spans = recognizer.recognize(text, custom_entities)
-        return _ok({"spans": [_span_to_dict(span) for span in spans]})
-
-    @app.post("/v1/recognize/builtin")
-    def recognize_builtin():
-        # 内置实体识别：主要覆盖 wordtag 人名/组织识别和手机号正则补漏。
-        payload = _get_json_payload()
-        text = _get_text(payload)
-        spans = recognizer.recognize_builtin(text)
-        return _ok({"spans": [_span_to_dict(span) for span in spans]})
-
-    @app.post("/v1/recognize/custom")
-    def recognize_custom():
-        # 自定义实体识别：只处理 custom_entities 中通过 uie_schema 声明的抽取目标。
-        payload = _get_json_payload()
-        text = _get_text(payload)
-        custom_entities = _get_custom_entities(payload)
-        spans = recognizer.recognize_custom(text, custom_entities)
+        tasks = _get_tasks(payload)
+        spans = recognizer.infer(text, tasks)
         return _ok({"spans": [_span_to_dict(span) for span in spans]})
 
     @app.errorhandler(ValueError)
@@ -140,12 +125,17 @@ def _get_text(payload: dict[str, Any]) -> str:
     return text
 
 
-def _get_custom_entities(payload: dict[str, Any]) -> list[Any]:
-    """读取业务自定义实体声明；非法结构按空列表处理。"""
-    custom_entities = payload.get("custom_entities")
-    if not isinstance(custom_entities, list):
-        return []
-    return custom_entities
+def _get_tasks(payload: dict[str, Any]) -> dict[str, Any]:
+    """读取模型推理任务。"""
+    tasks = payload.get("tasks")
+    if not isinstance(tasks, dict):
+        return {"wordtag": True, "uie_schema": []}
+    return {
+        "wordtag": tasks.get("wordtag", True) is not False,
+        "uie_schema": tasks.get("uie_schema")
+        if isinstance(tasks.get("uie_schema"), list)
+        else [],
+    }
 
 
 def _ok(data: dict[str, Any]):
@@ -153,14 +143,15 @@ def _ok(data: dict[str, Any]):
     return jsonify({"code": 0, "message": "ok", "data": data})
 
 
-def _span_to_dict(span: EntitySpan) -> dict[str, Any]:
-    """把内部 EntitySpan 转成可 JSON 序列化的响应对象。"""
+def _span_to_dict(span: ModelSpan) -> dict[str, Any]:
+    """把内部 ModelSpan 转成可 JSON 序列化的响应对象。"""
     return {
-        "entity_type": span.entity_type,
+        "label": span.label,
         "text": span.text,
         "start": span.start,
         "end": span.end,
         "source": span.source,
+        "probability": span.probability,
     }
 
 

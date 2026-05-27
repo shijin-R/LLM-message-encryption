@@ -1,26 +1,20 @@
 from pathlib import Path
 import unittest
 
+from desensitize.application_recognizer import ApplicationEntityRecognizer
 from desensitize.config import ServiceConfig
 from desensitize.recognizer import LocalEntityRecognizer
 from desensitize.service import DesensitizeService
-from desensitize.types import EntitySpan
+from desensitize.types import EntitySpan, ModelSpan
 
 
 class EmptyRecognizer:
-    def recognize_builtin(self, text: str) -> list[EntitySpan]:
-        return []
-
-    def recognize_custom(
-        self,
-        text: str,
-        custom_entities: list[dict],
-    ) -> list[EntitySpan]:
+    def recognize(self, text: str, custom_entities: list[dict]) -> list[EntitySpan]:
         return []
 
 
 class FakeRecognizer:
-    def recognize_builtin(self, text: str) -> list[EntitySpan]:
+    def recognize(self, text: str, custom_entities: list[dict]) -> list[EntitySpan]:
         spans: list[EntitySpan] = []
         for entity_type, value, source in (
             ("ORG", "上海泛微网络科技股份有限公司", "model"),
@@ -32,22 +26,15 @@ class FakeRecognizer:
                 spans.append(
                     EntitySpan(entity_type, value, start, start + len(value), source)
                 )
-        return spans
 
-    def recognize_custom(
-        self,
-        text: str,
-        custom_entities: list[dict],
-    ) -> list[EntitySpan]:
         if not isinstance(custom_entities, list):
-            return []
+            return spans
 
         requested_types = {
             str(rule.get("entity_type", "CUSTOM")).upper()
             for rule in custom_entities
             if isinstance(rule, dict)
         }
-        spans: list[EntitySpan] = []
         for entity_type, value in (
             ("PERSON", "李四"),
             ("ORG", "北京测试科技有限公司"),
@@ -78,6 +65,64 @@ class FakeUIETaskflow:
         return [result]
 
 
+class EmptyModelClient:
+    using_taskflow = False
+    using_uie = False
+
+    def infer(self, text: str, tasks: dict) -> list[ModelSpan]:
+        return []
+
+
+class FindingModelClient:
+    using_taskflow = False
+    using_uie = True
+
+    def __init__(self, token_by_label: dict[str, str]) -> None:
+        self.token_by_label = token_by_label
+
+    def infer(self, text: str, tasks: dict) -> list[ModelSpan]:
+        spans: list[ModelSpan] = []
+        for label in tasks.get("uie_schema", []):
+            token = self.token_by_label.get(label)
+            if not token:
+                continue
+            start = text.find(token)
+            if start >= 0:
+                spans.append(
+                    ModelSpan(label, token, start, start + len(token), "uie", 0.98)
+                )
+        return spans
+
+
+class StaticModelClient:
+    using_taskflow = True
+    using_uie = True
+
+    def __init__(self, spans: list[ModelSpan]) -> None:
+        self.spans = spans
+
+    def infer(self, text: str, tasks: dict) -> list[ModelSpan]:
+        spans: list[ModelSpan] = []
+        uie_schema = set(tasks.get("uie_schema", []))
+        for span in self.spans:
+            if span.source == "wordtag" and not tasks.get("wordtag", True):
+                continue
+            if span.source == "uie" and span.label not in uie_schema:
+                continue
+            if text[span.start : span.end] == span.text:
+                spans.append(span)
+        return spans
+
+
+class RecordingModelClient:
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    def infer(self, text: str, tasks: dict) -> list[ModelSpan]:
+        self.calls.append(dict(tasks))
+        return []
+
+
 class CombinedRecognizer:
     def __init__(self) -> None:
         self.calls = 0
@@ -97,15 +142,9 @@ class CombinedRecognizer:
             )
         ]
 
-    def recognize_builtin(self, text: str) -> list[EntitySpan]:
-        raise AssertionError("combined recognizer should use recognize()")
 
-    def recognize_custom(
-        self,
-        text: str,
-        custom_entities: list[dict],
-    ) -> list[EntitySpan]:
-        raise AssertionError("combined recognizer should use recognize()")
+def build_mobile_only_recognizer(max_text_len: int = 512) -> ApplicationEntityRecognizer:
+    return ApplicationEntityRecognizer(EmptyModelClient(), max_text_len=max_text_len)
 
 
 class DesensitizeServiceTest(unittest.TestCase):
@@ -399,63 +438,195 @@ class DesensitizeServiceTest(unittest.TestCase):
 
         matches = [
             match.group()
-            for match in LocalEntityRecognizer.MOBILE_PATTERN.finditer(text)
+            for match in ApplicationEntityRecognizer.MOBILE_PATTERN.finditer(text)
         ]
 
         self.assertEqual(matches, ["13800138000"])
 
-    def test_custom_model_labels_are_ignored_by_uie_custom_path(self) -> None:
+    def test_model_infer_wordtag_returns_raw_labels_without_mobile_regex(self) -> None:
         recognizer = LocalEntityRecognizer.__new__(LocalEntityRecognizer)
-        recognizer.max_text_len = 10000
+        recognizer._taskflow = lambda content: [("张三", "人名")]
         recognizer.strict_local_model = True
-        recognizer.strict_uie_model = True
-        recognizer.enable_uie_custom = True
-        recognizer._uie_taskflow = None
-        recognizer._uie_schema = ()
 
-        def fail_if_uie_loaded(schema: list[str]):
-            raise AssertionError("model_labels must not trigger UIE loading")
-
-        recognizer._ensure_uie_taskflow = fail_if_uie_loaded
-
-        spans = recognizer.recognize_custom(
-            "联系人张三",
-            [{"entity_type": "PERSON", "model_labels": ["人名"]}],
+        spans = recognizer.infer(
+            "联系人张三，手机号13800138000。",
+            {"wordtag": True, "uie_schema": []},
         )
 
-        self.assertEqual(spans, [])
+        self.assertEqual(
+            [(span.label, span.text, span.source) for span in spans],
+            [("人名", "张三", "wordtag")],
+        )
+        self.assertFalse(any(span.text == "13800138000" for span in spans))
 
-    def test_custom_uie_address_filters_field_word_and_keeps_real_address(self) -> None:
+    def test_model_infer_uie_accepts_schema_without_business_entity_type(self) -> None:
         fake_uie = FakeUIETaskflow(
             {
-                "地址": [
+                "身份证号": [
                     {
-                        "text": "地址",
-                        "start": 0,
-                        "end": 2,
-                        "probability": 0.99,
-                    },
-                    {
-                        "text": "北京市海淀区中关村大街27号",
-                        "start": 3,
-                        "end": 17,
+                        "text": "110101199003071234",
+                        "start": 6,
+                        "end": 24,
                         "probability": 0.98,
-                    },
+                    }
                 ]
             }
         )
         recognizer = LocalEntityRecognizer.__new__(LocalEntityRecognizer)
-        recognizer.max_text_len = 10000
-        recognizer.strict_local_model = True
         recognizer.strict_uie_model = True
-        recognizer.enable_uie_custom = True
         recognizer._uie_taskflow = fake_uie
         recognizer._uie_schema = ()
         recognizer._ensure_uie_taskflow = lambda schema: (
             fake_uie.set_schema(schema) or fake_uie
         )
 
-        spans = recognizer.recognize_custom(
+        spans = recognizer.infer(
+            "客户身份证号110101199003071234。",
+            {"wordtag": False, "uie_schema": ["身份证号"]},
+        )
+
+        self.assertEqual(fake_uie.schema, ["身份证号"])
+        self.assertEqual(spans[0].label, "身份证号")
+        self.assertEqual(spans[0].source, "uie")
+        self.assertEqual(spans[0].probability, 0.98)
+        self.assertFalse(hasattr(spans[0], "entity_type"))
+
+    def test_application_maps_wordtag_labels_to_business_entities(self) -> None:
+        text = "联系人张三来自上海泛微网络科技股份有限公司。"
+        person = "张三"
+        org = "上海泛微网络科技股份有限公司"
+        person_start = text.find(person)
+        org_start = text.find(org)
+        recognizer = ApplicationEntityRecognizer(
+            StaticModelClient(
+                [
+                    ModelSpan(
+                        "人名",
+                        person,
+                        person_start,
+                        person_start + len(person),
+                        "wordtag",
+                    ),
+                    ModelSpan(
+                        "组织机构",
+                        org,
+                        org_start,
+                        org_start + len(org),
+                        "wordtag",
+                    ),
+                ]
+            )
+        )
+
+        spans = recognizer.recognize(text, [])
+
+        self.assertEqual(
+            [(span.entity_type, span.text, span.source) for span in spans],
+            [
+                ("PERSON", "张三", "model"),
+                ("ORG", "上海泛微网络科技股份有限公司", "model"),
+            ],
+        )
+
+    def test_long_builtin_text_is_chunked_before_recognition(self) -> None:
+        self.service.recognizer = build_mobile_only_recognizer()
+        text = "说明：" + ("甲" * 520) + "手机号13800138000。"
+
+        result = self.preprocess(
+            [{"role": "user", "content": text, "encrypted": False}]
+        )
+
+        masked = result["desensitized_request"]["messages"][0]["content"]
+        self.assertIn("手机号[[MOBILE_001]]", masked)
+        self.assertNotIn("13800138000", masked)
+        self.assertEqual(result["mapping"]["MOBILE"]["13800138000"], "[[MOBILE_001]]")
+
+    def test_entity_crossing_chunk_boundary_keeps_original_coordinates(self) -> None:
+        recognizer = build_mobile_only_recognizer(max_text_len=64)
+        text = ("A" * 58) + "13800138000" + "完成"
+
+        spans = recognizer.recognize(text, [])
+
+        self.assertEqual(len(spans), 1)
+        self.assertEqual(spans[0].start, 58)
+        self.assertEqual(spans[0].end, 69)
+        self.assertEqual(text[spans[0].start : spans[0].end], "13800138000")
+
+    def test_overlapped_chunks_do_not_create_duplicate_mapping(self) -> None:
+        self.service.recognizer = build_mobile_only_recognizer(max_text_len=64)
+        text = ("A" * 40) + "13800138000" + ("B" * 50)
+
+        result = self.preprocess(
+            [{"role": "user", "content": text, "encrypted": False}]
+        )
+
+        masked = result["desensitized_request"]["messages"][0]["content"]
+        self.assertEqual(masked.count("[[MOBILE_001]]"), 1)
+        self.assertEqual(result["stats"]["replacements"], 1)
+        self.assertEqual(
+            result["mapping"]["MOBILE"],
+            {"13800138000": "[[MOBILE_001]]"},
+        )
+
+    def test_long_custom_uie_text_is_chunked_before_recognition(self) -> None:
+        id_card = "110101199003071234"
+        bank_card = "6222020202020202020"
+        self.service.recognizer = ApplicationEntityRecognizer(
+            FindingModelClient(
+                {
+                    "身份证号": id_card,
+                    "银行卡号": bank_card,
+                }
+            )
+        )
+        text = (
+            "客户资料："
+            + ("甲" * 520)
+            + f"身份证号{id_card}，银行卡号{bank_card}。"
+        )
+
+        result = self.preprocess(
+            [{"role": "user", "content": text, "encrypted": False}],
+            custom_entities=[
+                {"entity_type": "ID_CARD", "uie_schema": ["身份证号"]},
+                {"entity_type": "BANK_CARD", "uie_schema": ["银行卡号"]},
+            ],
+        )
+
+        masked = result["desensitized_request"]["messages"][0]["content"]
+        self.assertIn("身份证号[[ID_CARD_001]]", masked)
+        self.assertIn("银行卡号[[BANK_CARD_001]]", masked)
+        self.assertNotIn(id_card, masked)
+        self.assertNotIn(bank_card, masked)
+        self.assertEqual(result["mapping"]["ID_CARD"][id_card], "[[ID_CARD_001]]")
+        self.assertEqual(
+            result["mapping"]["BANK_CARD"][bank_card],
+            "[[BANK_CARD_001]]",
+        )
+
+    def test_custom_model_labels_are_ignored_by_uie_custom_path(self) -> None:
+        model_client = RecordingModelClient()
+        recognizer = ApplicationEntityRecognizer(model_client)
+
+        spans = recognizer.recognize(
+            "联系人张三",
+            [{"entity_type": "PERSON", "model_labels": ["人名"]}],
+        )
+
+        self.assertEqual(spans, [])
+        self.assertEqual(model_client.calls[0]["uie_schema"], [])
+
+    def test_custom_uie_address_filters_field_word_and_keeps_real_address(self) -> None:
+        recognizer = ApplicationEntityRecognizer(
+            StaticModelClient(
+                [
+                    ModelSpan("地址", "地址", 0, 2, "uie", 0.99),
+                    ModelSpan("地址", "北京市海淀区中关村大街27号", 3, 17, "uie", 0.98),
+                ]
+            )
+        )
+
+        spans = recognizer.recognize(
             "地址：北京市海淀区中关村大街27号",
             [{"entity_type": "ADDRESS", "uie_schema": ["地址"]}],
         )
@@ -469,40 +640,16 @@ class DesensitizeServiceTest(unittest.TestCase):
 
     def test_custom_uie_masks_id_card_and_bank_card(self) -> None:
         text = "客户身份证号110101199003071234，银行卡号6222020202020202020。"
-        fake_uie = FakeUIETaskflow(
-            {
-                "身份证号": [
-                    {
-                        "text": "110101199003071234",
-                        "start": 6,
-                        "end": 24,
-                        "probability": 0.98,
-                    }
-                ],
-                "银行卡号": [
-                    {
-                        "text": "6222020202020202020",
-                        "start": 29,
-                        "end": 48,
-                        "probability": 0.97,
-                    }
-                ],
-            }
+        recognizer = ApplicationEntityRecognizer(
+            StaticModelClient(
+                [
+                    ModelSpan("身份证号", "110101199003071234", 6, 24, "uie", 0.98),
+                    ModelSpan("银行卡号", "6222020202020202020", 29, 48, "uie", 0.97),
+                ]
+            )
         )
 
-        recognizer = LocalEntityRecognizer.__new__(LocalEntityRecognizer)
-        recognizer.max_text_len = 10000
-        recognizer.strict_local_model = True
-        recognizer.strict_uie_model = True
-        recognizer.enable_uie_custom = True
-        recognizer._taskflow = None
-        recognizer._uie_taskflow = fake_uie
-        recognizer._uie_schema = ()
-        recognizer._ensure_uie_taskflow = lambda schema: (
-            fake_uie.set_schema(schema) or fake_uie
-        )
-
-        spans = recognizer.recognize_custom(
+        spans = recognizer.recognize(
             text,
             [
                 {"entity_type": "ID_CARD", "uie_schema": ["身份证号"]},
@@ -520,41 +667,14 @@ class DesensitizeServiceTest(unittest.TestCase):
 
     def test_preprocess_masks_uie_custom_id_card_and_bank_card(self) -> None:
         text = "客户身份证号110101199003071234，银行卡号6222020202020202020。"
-        fake_uie = FakeUIETaskflow(
-            {
-                "身份证号": [
-                    {
-                        "text": "110101199003071234",
-                        "start": 6,
-                        "end": 24,
-                        "probability": 0.98,
-                    }
-                ],
-                "银行卡号": [
-                    {
-                        "text": "6222020202020202020",
-                        "start": 29,
-                        "end": 48,
-                        "probability": 0.97,
-                    }
-                ],
-            }
+        self.service.recognizer = ApplicationEntityRecognizer(
+            StaticModelClient(
+                [
+                    ModelSpan("身份证号", "110101199003071234", 6, 24, "uie", 0.98),
+                    ModelSpan("银行卡号", "6222020202020202020", 29, 48, "uie", 0.97),
+                ]
+            )
         )
-        recognizer = LocalEntityRecognizer.__new__(LocalEntityRecognizer)
-        recognizer.max_text_len = 10000
-        recognizer.strict_local_model = True
-        recognizer.strict_uie_model = True
-        recognizer.enable_uie_custom = True
-        recognizer._taskflow = None
-        recognizer._uie_taskflow = fake_uie
-        recognizer._uie_schema = ()
-        recognizer._ensure_uie_taskflow = lambda schema: (
-            fake_uie.set_schema(schema) or fake_uie
-        )
-        recognizer._extract_with_taskflow = lambda content: []
-        recognizer._extract_mobile = lambda content: []
-
-        self.service.recognizer = recognizer
 
         result = self.preprocess(
             [{"role": "user", "content": text, "encrypted": False}],

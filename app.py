@@ -25,74 +25,36 @@ def create_app() -> Flask:
     def build_health_data() -> dict:
         data = {
             "status": "ok",
-            "recognizer_backend": config.recognizer_backend,
             "model_service_url": config.model_service_url,
             "model_service_timeout": config.model_service_timeout,
         }
 
-        if config.recognizer_backend in {"remote", "http"}:
-            try:
-                data["model_service_status"] = "ok"
-                data["model_service"] = service.recognizer.health()
-            except Exception as exc:
-                data["model_service_status"] = "unavailable"
-                data["model_service_error"] = str(exc)
-            return data
-
-        data.update(
-            {
-                "model_path": str(config.model_path),
-                "strict_local_model": config.strict_local_model,
-                "enable_taskflow": config.enable_taskflow,
-                "auto_download_model": config.auto_download_model,
-                "sync_downloaded_model": config.sync_downloaded_model,
-                "model_cache_path": str(config.downloaded_model_cache_path),
-                "using_taskflow": service.recognizer.using_taskflow,
-                "enable_uie_custom": config.enable_uie_custom,
-                "uie_model_name": config.uie_model_name,
-                "uie_model_path": str(config.uie_model_path),
-                "uie_position_prob": config.uie_position_prob,
-                "strict_uie_model": config.strict_uie_model,
-                "uie_model_cache_path": str(config.downloaded_uie_model_cache_path),
-                "using_uie": service.recognizer.using_uie,
-            }
-        )
+        try:
+            data["model_service_status"] = "ok"
+            data["model_service"] = service.recognizer.health()
+        except Exception as exc:
+            data["model_service_status"] = "unavailable"
+            data["model_service_error"] = str(exc)
         return data
 
     def build_ready_data() -> tuple[dict, int]:
-        if config.recognizer_backend in {"remote", "http"}:
-            try:
-                model_ready = service.recognizer.ready()
-                return (
-                    {
-                        "status": "ready",
-                        "recognizer_backend": config.recognizer_backend,
-                        "model_service": model_ready,
-                    },
-                    200,
-                )
-            except Exception as exc:
-                return (
-                    {
-                        "status": "not_ready",
-                        "recognizer_backend": config.recognizer_backend,
-                        "model_service_error": str(exc),
-                    },
-                    503,
-                )
-
-        wordtag_ready = not config.enable_taskflow or service.recognizer.using_taskflow
-        ready = wordtag_ready
-        return (
-            {
-                "status": "ready" if ready else "not_ready",
-                "recognizer_backend": config.recognizer_backend,
-                "wordtag_ready": wordtag_ready,
-                "using_taskflow": service.recognizer.using_taskflow,
-                "using_uie": service.recognizer.using_uie,
-            },
-            200 if ready else 503,
-        )
+        try:
+            model_ready = service.recognizer.ready()
+            return (
+                {
+                    "status": "ready",
+                    "model_service": model_ready,
+                },
+                200,
+            )
+        except Exception as exc:
+            return (
+                {
+                    "status": "not_ready",
+                    "model_service_error": str(exc),
+                },
+                503,
+            )
 
     @app.get("/healthz")
     def healthz():

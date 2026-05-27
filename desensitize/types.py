@@ -4,6 +4,29 @@ from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
+class ModelSpan:
+    """模型推理返回的原始标签片段。
+
+    label: 模型标签或 UIE schema 标签
+    text: 命中文本
+    start/end: 在输入文本中的字符区间（左闭右开）
+    source: 推理来源（wordtag/uie）
+    probability: 模型置信度；无置信度时为 None
+    """
+
+    label: str
+    text: str
+    start: int
+    end: int
+    source: str
+    probability: float | None = None
+
+    @property
+    def length(self) -> int:
+        return self.end - self.start
+
+
+@dataclass(frozen=True)
 class EntitySpan:
     """文本中的实体片段。
 

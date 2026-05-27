@@ -195,14 +195,8 @@ class DesensitizeService:
         text: str,
         custom_entities: list[Any],
     ) -> list[EntitySpan]:
-        """执行模型识别；远程后端可用组合接口减少 HTTP 往返。"""
-        recognize = getattr(self.recognizer, "recognize", None)
-        if callable(recognize):
-            return list(recognize(text, custom_entities))
-        return [
-            *self.recognizer.recognize_custom(text, custom_entities),
-            *self.recognizer.recognize_builtin(text),
-        ]
+        """执行应用层实体识别编排。"""
+        return list(self.recognizer.recognize(text, custom_entities))
 
     def _extract_mapping_spans(
         self,

@@ -1,13 +1,10 @@
-"""内置实体识别器。
+"""本地模型推理适配器。
 
-组合多路识别能力：
-1) PaddleNLP Taskflow NER 的 wordtag 模型（优先）
-2) 可选 PaddleNLP Taskflow information_extraction 的 UIE 模型旁路识别自定义实体
-3) 手机号正则抽取
+只负责加载并调用 PaddleNLP Taskflow wordtag / UIE 模型，返回原始模型标签。
+业务实体类型映射、正则补漏、长文本切分和占位符处理都在应用层完成。
 """
 
 import logging
-import re
 import shutil
 import threading
 from collections.abc import Callable, Iterator
@@ -15,8 +12,7 @@ from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
-from .mapping import normalize_entity_type
-from .types import EntitySpan
+from .types import ModelSpan
 
 
 logger = logging.getLogger(__name__)
@@ -27,36 +23,13 @@ class LocalEntityRecognizer:
     # 正确入口是 Taskflow("ner")，其 accurate 模式内部使用 wordtag 模型。
     TASKFLOW_TASK = "ner"
     UIE_TASKFLOW_TASK = "information_extraction"
-    TASKFLOW_ENTITY_SOURCE = "model"
-
-    MOBILE_PATTERN = re.compile(r"(?<!\d)1[3-9]\d{9}(?!\d)")
-    CHINESE_PATTERN = re.compile(r"[\u4e00-\u9fff]")
-    PERSON_BAD_CASE = {
-        "谢谢",
-        "人名",
-        "姓名",
-        "联系人",
-        "今天上午",
-        "今天下午",
-    }
-    ORG_BAD_CASE = {"集团", "各部门"}
-    ADDRESS_BAD_CASE = {
-        "地址",
-        "住址",
-        "现住址",
-        "家庭住址",
-        "联系地址",
-        "通信地址",
-        "通讯地址",
-        "收货地址",
-        "户籍地址",
-    }
+    WORDTAG_SOURCE = "wordtag"
+    UIE_SOURCE = "uie"
 
     def __init__(
         self,
         model_path: Path,
         device_id: int = 0,
-        max_text_len: int = 10000,
         enable_taskflow: bool = True,
         strict_local_model: bool = True,
         auto_download_model: bool = True,
@@ -72,7 +45,6 @@ class LocalEntityRecognizer:
         # 初始化识别器配置。
         self.model_path = Path(model_path)
         self.device_id = device_id
-        self.max_text_len = max_text_len
         self.enable_taskflow = enable_taskflow
         self.strict_local_model = strict_local_model
         self.auto_download_model = auto_download_model
@@ -130,7 +102,7 @@ class LocalEntityRecognizer:
     def _build_taskflow(self):
         """按配置创建 Taskflow 推理实例，不可用时自动降级。"""
         if not self.enable_taskflow:
-            logger.info("Taskflow wordtag is disabled; fallback to mobile regex")
+            logger.info("Taskflow wordtag is disabled")
             return None
 
         try:
@@ -138,10 +110,10 @@ class LocalEntityRecognizer:
         except ImportError as exc:
             if self.strict_local_model:
                 raise RuntimeError(
-                    "paddlenlp is required. Please install dependencies from requirements.txt"
+                    "paddlenlp is required. Please install dependencies from requirements-model.txt"
                 ) from exc
             logger.warning(
-                "paddlenlp is not available, fallback to mobile regex: %s",
+                "paddlenlp is not available, skip wordtag inference: %s",
                 exc,
             )
             return None
@@ -177,7 +149,7 @@ class LocalEntityRecognizer:
             )
 
         logger.warning(
-            "Local model is unavailable; fallback to mobile regex. "
+            "Local model is unavailable; skip wordtag inference. "
             "model_path=%s auto_download_model=%s",
             self.model_path,
             self.auto_download_model,
@@ -410,28 +382,28 @@ class LocalEntityRecognizer:
                 exc,
             )
 
-    def recognize_builtin(self, text: str) -> list[EntitySpan]:
-        """执行内置实体识别并输出去重结果。"""
-        if not text or len(text) > self.max_text_len:
+    def infer(self, text: str, tasks: dict[str, Any] | None = None) -> list[ModelSpan]:
+        """按任务执行纯模型推理，返回原始模型标签。"""
+        if not text:
             return []
 
-        # Taskflow wordtag 为主，手机号正则补漏。
-        spans = [
-            *self._extract_with_taskflow(text),
-            *self._extract_mobile(text),
-        ]
-        return self._deduplicate_spans(spans, text)
+        normalized_tasks = tasks if isinstance(tasks, dict) else {}
+        run_wordtag = normalized_tasks.get("wordtag", True) is not False
+        uie_schema = self._normalize_uie_schema(normalized_tasks.get("uie_schema"))
 
-    def recognize(
-        self,
-        text: str,
-        custom_entities: list[Any],
-    ) -> list[EntitySpan]:
-        """一次性执行自定义识别和内置识别，供独立模型服务减少调用次数。"""
-        return [
-            *self.recognize_custom(text, custom_entities),
-            *self.recognize_builtin(text),
-        ]
+        spans: list[ModelSpan] = []
+        if run_wordtag:
+            spans.extend(self.infer_wordtag(text))
+        if uie_schema:
+            spans.extend(self.infer_uie(text, uie_schema))
+
+        return self._deduplicate_model_spans(spans, text)
+
+    def infer_wordtag(self, text: str) -> list[ModelSpan]:
+        """执行 wordtag 模型推理。"""
+        if not text:
+            return []
+        return self._deduplicate_model_spans(self._extract_with_taskflow(text), text)
 
     def warmup_uie(self, schema: list[str] | tuple[str, ...]) -> bool:
         """按给定 schema 预加载 UIE 模型。"""
@@ -439,32 +411,22 @@ class LocalEntityRecognizer:
         with lock:
             return self._ensure_uie_taskflow(list(schema)) is not None
 
-    def recognize_custom(
-        self,
-        text: str,
-        custom_entities: list[Any],
-    ) -> list[EntitySpan]:
-        """使用 UIE 信息抽取模型识别业务方声明的自定义实体。
-
-        这里不会执行业务方传入的 regex/pattern/value 字符串匹配；自定义实体只通过
-        UIE 模型返回结果命中。`uie_schema` 用于声明 UIE 信息抽取目标；
-        未提供 UIE schema 时不会触发自定义实体识别。
-        """
-        if not text or len(text) > self.max_text_len:
-            return []
-        if not isinstance(custom_entities, list):
+    def infer_uie(self, text: str, schema: list[str]) -> list[ModelSpan]:
+        """按 schema 执行 UIE 模型推理。"""
+        if not text:
             return []
 
-        uie_rules, uie_schema = self._normalize_custom_uie_rules(custom_entities)
-        if not uie_rules:
+        uie_schema = self._normalize_uie_schema(schema)
+        if not uie_schema:
             return []
 
-        spans = self._extract_custom_with_uie(text, uie_rules, uie_schema)
-        spans = self._merge_adjacent_custom_spans(spans, text)
-        return self._deduplicate_spans(spans, text)
+        return self._deduplicate_model_spans(
+            self._extract_with_uie(text, uie_schema),
+            text,
+        )
 
-    def _extract_with_taskflow(self, text: str) -> list[EntitySpan]:
-        """使用 Taskflow NER wordtag 抽取人名/机构。"""
+    def _extract_with_taskflow(self, text: str) -> list[ModelSpan]:
+        """使用 Taskflow NER wordtag 抽取模型标签片段。"""
         pairs = self._extract_taskflow_pairs(text)
         if not pairs:
             return []
@@ -472,11 +434,11 @@ class LocalEntityRecognizer:
         if any(self._split_bioes_tag(tag)[0] for _, tag in pairs):
             return self._extract_bioes_taskflow_spans(text, pairs)
 
-        spans: list[EntitySpan] = []
+        spans: list[ModelSpan] = []
 
         # Taskflow("ner") 的 accurate 模式内部使用 wordtag，通常返回 [(token, tag), ...]。
         for token, tag, start, end in self._iter_located_tokens(text, pairs):
-            self._append_model_span(spans, tag, token, start, end)
+            spans.append(ModelSpan(tag, token, start, end, self.WORDTAG_SOURCE))
 
         return spans
 
@@ -484,17 +446,16 @@ class LocalEntityRecognizer:
         self,
         text: str,
         pairs: list[tuple[str, str]],
-    ) -> list[EntitySpan]:
+    ) -> list[ModelSpan]:
         """兼容 BIOES 标签序列输出。"""
-        return self._extract_bioes_spans(text, pairs, self._make_model_span)
+        return self._extract_bioes_spans(text, pairs, self._make_wordtag_span)
 
-    def _extract_custom_with_uie(
+    def _extract_with_uie(
         self,
         text: str,
-        rules: list[tuple[str, set[str]]],
         schema: list[str],
-    ) -> list[EntitySpan]:
-        """按自定义 schema 从 UIE 输出中抽取实体。"""
+    ) -> list[ModelSpan]:
+        """按 schema 从 UIE 输出中抽取模型标签片段。"""
         lock = getattr(self, "_uie_lock", nullcontext())
         with lock:
             uie_taskflow = self._ensure_uie_taskflow(schema)
@@ -509,33 +470,29 @@ class LocalEntityRecognizer:
                 logger.warning("Taskflow UIE inference failed, skip UIE extraction: %s", exc)
                 return []
 
-        return list(self._iter_uie_spans(text, tagged, rules))
+        return list(self._iter_uie_spans(text, tagged))
 
     def _iter_uie_spans(
         self,
         text: str,
         tagged: Any,
-        rules: list[tuple[str, set[str]]],
-    ) -> Iterator[EntitySpan]:
-        """把 UIE 输出结构转换为 EntitySpan。"""
+    ) -> Iterator[ModelSpan]:
+        """把 UIE 输出结构转换为 ModelSpan。"""
         cursor_by_text: dict[str, int] = {}
 
         for label, item in self._iter_uie_items(tagged):
-            entity_type = self._match_custom_entity_type(label, rules)
-            if not entity_type:
-                continue
-
             token = item.get("text") if isinstance(item, dict) else None
             if token is None:
                 continue
             token = str(token)
-            if not self._looks_valid_entity(entity_type, token):
-                continue
 
             start, end = self._get_uie_item_span(text, item, token, cursor_by_text)
             if start < 0 or end <= start:
                 continue
-            yield EntitySpan(entity_type, token, start, end, "custom")
+            probability = item.get("probability")
+            if not isinstance(probability, (int, float)):
+                probability = None
+            yield ModelSpan(str(label), token, start, end, self.UIE_SOURCE, probability)
 
     @classmethod
     def _iter_uie_items(cls, tagged: Any) -> Iterator[tuple[str, dict[str, Any]]]:
@@ -590,10 +547,10 @@ class LocalEntityRecognizer:
         self,
         text: str,
         pairs: list[tuple[str, str]],
-        span_factory: Callable[[str, str, int, int], EntitySpan | None],
-    ) -> list[EntitySpan]:
+        span_factory: Callable[[str, str, int, int], ModelSpan | None],
+    ) -> list[ModelSpan]:
         """把 BIOES token/tag 序列还原为实体片段。"""
-        spans: list[EntitySpan] = []
+        spans: list[ModelSpan] = []
         cursor = 0
         active_label = ""
         active_start = -1
@@ -647,94 +604,61 @@ class LocalEntityRecognizer:
         flush_active()
         return spans
 
-    def _normalize_custom_uie_rules(
-        self,
-        custom_entities: list[Any],
-    ) -> tuple[list[tuple[str, set[str]]], list[str]]:
-        """把 custom_entities 转成 UIE schema 和输出标签匹配规则。"""
-        if not getattr(self, "enable_uie_custom", False):
-            return [], []
+    @staticmethod
+    def _make_wordtag_span(
+        tag: str,
+        token: str,
+        start: int,
+        end: int,
+    ) -> ModelSpan:
+        return ModelSpan(tag, token, start, end, LocalEntityRecognizer.WORDTAG_SOURCE)
 
-        rules: list[tuple[str, set[str]]] = []
+    @staticmethod
+    def _normalize_uie_schema(value: Any) -> list[str]:
+        if not isinstance(value, list):
+            return []
+
         schema: list[str] = []
-        seen_schema: set[str] = set()
+        seen: set[str] = set()
+        for item in value:
+            label = str(item or "").strip()
+            if not label or label in seen:
+                continue
+            seen.add(label)
+            schema.append(label)
+        return schema
 
-        for rule in custom_entities:
-            if not isinstance(rule, dict):
+    def _deduplicate_model_spans(
+        self,
+        spans: list[ModelSpan],
+        text: str,
+    ) -> list[ModelSpan]:
+        unique: dict[tuple[str, int, int, str, str], ModelSpan] = {}
+        for span in spans:
+            if span.start < 0 or span.end > len(text) or span.start >= span.end:
                 continue
 
-            raw_entity_type = rule.get("entity_type", rule.get("type", "CUSTOM"))
-            entity_type = normalize_entity_type(raw_entity_type)
-            raw_labels = list(
-                self._iter_label_values(
-                    rule.get("uie_schema")
-                    or rule.get("uie_labels")
-                    or rule.get("uie_label")
-                )
+            real_text = text[span.start : span.end]
+            if not real_text.strip():
+                continue
+
+            normalized = ModelSpan(
+                label=span.label,
+                text=real_text,
+                start=span.start,
+                end=span.end,
+                source=span.source,
+                probability=span.probability,
             )
-            if not raw_labels:
-                continue
-
-            labels = {self._normalize_label(label) for label in raw_labels}
-            labels = {label for label in labels if label}
-            if not labels:
-                continue
-
-            for label in raw_labels:
-                clean_label = str(label or "").strip()
-                if not clean_label or clean_label in seen_schema:
-                    continue
-                seen_schema.add(clean_label)
-                schema.append(clean_label)
-
-            rules.append((entity_type, labels))
-
-        return rules, schema
-
-    @classmethod
-    def _match_custom_entity_type(
-        cls,
-        tag: str,
-        rules: list[tuple[str, set[str]]],
-    ) -> str:
-        normalized_tag = cls._normalize_label(tag)
-        if not normalized_tag:
-            return ""
-
-        for entity_type, labels in rules:
-            if any(
-                label == normalized_tag
-                or label in normalized_tag
-                or normalized_tag in label
-                for label in labels
-            ):
-                return entity_type
-        return ""
-
-    def _append_model_span(
-        self,
-        spans: list[EntitySpan],
-        tag: str,
-        token: str,
-        start: int,
-        end: int,
-    ) -> None:
-        span = self._make_model_span(tag, token, start, end)
-        if span is not None:
-            spans.append(span)
-
-    def _make_model_span(
-        self,
-        tag: str,
-        token: str,
-        start: int,
-        end: int,
-    ) -> EntitySpan | None:
-        if self._is_org_tag(tag) and self._looks_valid_org(token):
-            return EntitySpan("ORG", token, start, end, self.TASKFLOW_ENTITY_SOURCE)
-        if self._is_person_tag(tag) and self._looks_valid_person(token):
-            return EntitySpan("PERSON", token, start, end, self.TASKFLOW_ENTITY_SOURCE)
-        return None
+            key = (
+                normalized.label,
+                normalized.start,
+                normalized.end,
+                normalized.text,
+                normalized.source,
+            )
+            unique[key] = normalized
+        return list(unique.values())
 
     def _extract_taskflow_pairs(self, text: str) -> list[tuple[str, str]]:
         """执行 Taskflow 并归一化为 token/tag 二元组。"""
@@ -790,45 +714,6 @@ class LocalEntityRecognizer:
         return "", tag
 
     @staticmethod
-    def _normalize_label(label: Any) -> str:
-        """标准化模型标签，便于中英文别名做包含匹配。"""
-        normalized = str(label or "").strip().lower()
-        return re.sub(r"\s+", "", normalized)
-
-    @staticmethod
-    def _ensure_list(value: Any) -> list[Any]:
-        if isinstance(value, list):
-            return value
-        if isinstance(value, tuple):
-            return list(value)
-        if value is None:
-            return []
-        if isinstance(value, dict):
-            label = (
-                value.get("name")
-                or value.get("label")
-                or value.get("type")
-                or value.get("entity_type")
-            )
-            return [label] if label is not None else []
-        return [value]
-
-    @classmethod
-    def _iter_label_values(cls, value: Any) -> Iterator[Any]:
-        for item in cls._ensure_list(value):
-            if isinstance(item, dict):
-                label = (
-                    item.get("name")
-                    or item.get("label")
-                    or item.get("type")
-                    or item.get("entity_type")
-                )
-                if label is not None:
-                    yield label
-                continue
-            yield item
-
-    @staticmethod
     def _iter_taskflow_tokens(tagged) -> Iterator[tuple[str, str]]:
         """兼容 PaddleNLP 不同版本的 wordtag 输出结构。"""
         if not isinstance(tagged, list):
@@ -857,156 +742,3 @@ class LocalEntityRecognizer:
 
             if isinstance(item, (list, tuple)) and len(item) >= 2:
                 yield str(item[0]), str(item[1])
-
-    def _extract_mobile(self, text: str) -> list[EntitySpan]:
-        """使用正则抽取手机号。"""
-        spans: list[EntitySpan] = []
-        for match in self.MOBILE_PATTERN.finditer(text):
-            spans.append(
-                EntitySpan(
-                    "MOBILE",
-                    match.group(),
-                    match.start(),
-                    match.end(),
-                    "regex",
-                )
-            )
-        return spans
-
-    @classmethod
-    def _is_person_tag(cls, tag: str) -> bool:
-        if "概念" in tag:
-            return False
-        if tag in {"人物类_实体", "文化类_姓氏与人名"}:
-            return True
-        return any(keyword in tag for keyword in ("人名", "人物", "姓氏"))
-
-    @classmethod
-    def _is_org_tag(cls, tag: str) -> bool:
-        if "概念" in tag:
-            return False
-        if tag == "品牌名":
-            return True
-        return any(keyword in tag for keyword in ("组织", "机构", "公司", "企业", "品牌"))
-
-    def _looks_valid_person(self, token: str) -> bool:
-        """过滤明显噪声的人名候选。"""
-        text = token.strip()
-        if len(text) <= 1 or len(text) > 20:
-            return False
-        if text in self.PERSON_BAD_CASE:
-            return False
-        if not self.CHINESE_PATTERN.search(text):
-            return False
-        if re.search(r"\d", text):
-            return False
-        return True
-
-    def _looks_valid_org(self, token: str) -> bool:
-        """过滤明显噪声的机构候选。"""
-        text = token.strip()
-        if len(text) <= 1:
-            return False
-        if text in self.ORG_BAD_CASE:
-            return False
-        if not re.search(r"[\u4e00-\u9fffA-Za-z]", text):
-            return False
-        return True
-
-    def _looks_valid_entity(self, entity_type: str, token: str) -> bool:
-        """按实体类型复用内置候选过滤，避免自定义 UIE 候选放大噪声。"""
-        normalized_type = normalize_entity_type(entity_type)
-        if normalized_type == "PERSON":
-            return self._looks_valid_person(token)
-        if normalized_type == "ORG":
-            return self._looks_valid_org(token)
-        if normalized_type == "ADDRESS":
-            return self._looks_valid_address(token)
-        return self._looks_valid_custom(token)
-
-    def _looks_valid_address(self, token: str) -> bool:
-        """过滤字段名，保留更像真实地点/地址的候选。"""
-        text = token.strip()
-        if len(text) <= 1:
-            return False
-        if text in self.ADDRESS_BAD_CASE:
-            return False
-        if not re.search(r"[\u4e00-\u9fffA-Za-z0-9]", text):
-            return False
-        if re.search(r"\d", text):
-            return True
-        return bool(re.search(r"[省市区县镇乡村街路巷道号楼室园场站口]", text))
-
-    def _merge_adjacent_custom_spans(
-        self,
-        spans: list[EntitySpan],
-        text: str,
-    ) -> list[EntitySpan]:
-        """合并模型切开的连续地址片段。"""
-        if not spans:
-            return []
-
-        merged: list[EntitySpan] = []
-        for span in sorted(spans, key=lambda item: (item.start, item.end)):
-            if merged and self._should_merge_custom_span(merged[-1], span, text):
-                previous = merged[-1]
-                merged[-1] = EntitySpan(
-                    entity_type=previous.entity_type,
-                    text=text[previous.start : span.end],
-                    start=previous.start,
-                    end=span.end,
-                    source=previous.source,
-                )
-                continue
-            merged.append(span)
-        return merged
-
-    @staticmethod
-    def _should_merge_custom_span(
-        left: EntitySpan,
-        right: EntitySpan,
-        text: str,
-    ) -> bool:
-        if left.entity_type != "ADDRESS" or right.entity_type != "ADDRESS":
-            return False
-        if left.source != "custom" or right.source != "custom":
-            return False
-        return text[left.end : right.start] == ""
-
-    @staticmethod
-    def _looks_valid_custom(token: str) -> bool:
-        """过滤空白和纯标点的自定义实体候选。"""
-        text = token.strip()
-        if not text:
-            return False
-        return bool(re.search(r"[\u4e00-\u9fffA-Za-z0-9]", text))
-
-    @staticmethod
-    def _deduplicate_spans(spans: list[EntitySpan], text: str) -> list[EntitySpan]:
-        """按实体类型 + 位置 + 文本去重。"""
-        unique: dict[tuple[str, int, int, str], EntitySpan] = {}
-
-        for span in spans:
-            if span.start < 0 or span.end > len(text) or span.start >= span.end:
-                continue
-
-            real_text = text[span.start : span.end]
-            if not real_text.strip():
-                continue
-
-            normalized_span = EntitySpan(
-                entity_type=span.entity_type,
-                text=real_text,
-                start=span.start,
-                end=span.end,
-                source=span.source,
-            )
-            key = (
-                normalized_span.entity_type,
-                normalized_span.start,
-                normalized_span.end,
-                normalized_span.text,
-            )
-            unique[key] = normalized_span
-
-        return list(unique.values())

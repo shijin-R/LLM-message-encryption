@@ -4,14 +4,16 @@
 
 ## 实体识别逻辑
 
-服务当前使用 PaddleNLP `Taskflow("ner", entity_only=True)` 的 wordtag 模型链路，本地模型目录默认为 `resources/models/wordtag`。业务自定义实体默认启用 `Taskflow("information_extraction", model="uie-base")` 旁路，本地模型目录默认为 `resources/models/uie-base`。
+模型服务当前使用 PaddleNLP `Taskflow("ner", entity_only=True)` 的 wordtag 模型链路，本地模型目录默认为 `resources/models/wordtag`。业务自定义实体默认启用 `Taskflow("information_extraction", model="uie-base")` 旁路，本地模型目录默认为 `resources/models/uie-base`。
+
+模型服务是纯推理层，只接收 `text` 和 `tasks`，通过内部接口 `POST /v1/infer` 返回模型原始标签片段。API 服务是应用层，负责长文本分片、手机号正则补漏、`custom_entities` 解析、历史 `mapping`、占位符、冲突消解和最终替换。
 
 一次脱敏会合并以下实体来源：
 
-- 历史 `mapping`：已脱敏 `user` 消息携带的映射会被优先复用，确保同一实体继续使用原占位符。
-- 内置模型识别：wordtag 默认用于识别人名、组织/公司等中文实体。
-- 规则补漏：手机号使用正则识别，避免通用模型漏掉纯数字手机号。
-- 自定义 UIE schema：`custom_entities[].uie_schema` 会作为 UIE 信息抽取目标，适合身份证号、银行卡号、平台账号等上下文依赖更强的实体。
+- 历史 `mapping`：应用层从已脱敏 `user` 消息携带的映射中复用占位符。
+- 内置模型识别：模型层返回 wordtag 原始标签，应用层映射为人名、组织/公司等业务实体。
+- 规则补漏：应用层用手机号正则识别，避免通用模型漏掉纯数字手机号。
+- 自定义 UIE schema：应用层把 `custom_entities[].uie_schema` 传给模型层，再把 UIE label 映射回业务实体类型。
 
 冲突处理优先级：
 
@@ -56,7 +58,6 @@ python -m pip install -r requirements-api.txt
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `DESENSITIZE_RECOGNIZER_BACKEND` | `remote` | API 服务识别后端；`remote` 为独立模型服务，`local` 为进程内模型 |
 | `DESENSITIZE_MODEL_SERVICE_URL` | `http://127.0.0.1:18002` | 独立模型服务地址 |
 | `DESENSITIZE_MODEL_SERVICE_TIMEOUT` | `30` | API 调用模型服务的超时时间，单位秒 |
 | `DESENSITIZE_MODEL_PATH` | `resources/models/wordtag` | wordtag 本地模型目录 |
@@ -68,30 +69,22 @@ python -m pip install -r requirements-api.txt
 | `DESENSITIZE_SYNC_DOWNLOADED_MODEL` | `true` | 自动下载后是否同步回本地模型目录 |
 | `DESENSITIZE_STRICT_LOCAL_MODEL` | `true` | wordtag 模型不可用时是否启动失败 |
 | `DESENSITIZE_STRICT_UIE_MODEL` | `false` | UIE 不可用时是否抛错 |
-| `DESENSITIZE_MAX_TEXT_LEN` | `10000` | 单条消息允许处理的最大长度 |
+| `DESENSITIZE_MAX_TEXT_LEN` | `512` | API 应用层单个识别分片最大长度；超出后会自动分片并合并识别结果 |
 | `DESENSITIZE_DEVICE_ID` | `0` | PaddleNLP 推理设备 ID |
 | `DESENSITIZE_UIE_POSITION_PROB` | `0.5` | UIE 起止位置概率阈值 |
 
 ## 本地启动与检查
 
-单进程本地模式：
-
-```powershell
-$env:DESENSITIZE_RECOGNIZER_BACKEND="local"
-python -u app.py
-```
-
-生产联调建议拆成两个进程。先启动模型服务：
+开发、测试和生产联调统一使用两个进程。先启动模型服务：
 
 ```powershell
 $env:MODEL_PORT="18002"
 python -u model_app.py
 ```
 
-再启动 API 服务：
+再启动 API 服务，并通过 `DESENSITIZE_MODEL_SERVICE_URL` 指向模型服务：
 
 ```powershell
-$env:DESENSITIZE_RECOGNIZER_BACKEND="remote"
 $env:DESENSITIZE_MODEL_SERVICE_URL="http://127.0.0.1:18002"
 python -u app.py
 ```
@@ -104,7 +97,7 @@ Invoke-RestMethod "http://127.0.0.1:18001/readyz" | ConvertTo-Json -Depth 10
 Invoke-RestMethod "http://127.0.0.1:18002/readyz" | ConvertTo-Json -Depth 10
 ```
 
-`using_taskflow=true` 表示 wordtag 模型已经成功初始化。单进程本地模式下，`using_uie=true` 表示 UIE 旁路已在当前进程中懒加载成功；服务刚启动且尚未处理 `uie_schema` 请求时通常为 `false`。模型服务模式下，如果开启了 `DESENSITIZE_PRELOAD_UIE_CUSTOM=true`，`/readyz` 会等 UIE 预加载完成后才返回 ready。
+`using_taskflow=true` 表示 wordtag 模型已经成功初始化。模型服务如果开启了 `DESENSITIZE_PRELOAD_UIE_CUSTOM=true`，`/readyz` 会等 UIE 预加载完成后才返回 ready。
 
 ## Docker 部署
 
@@ -296,7 +289,7 @@ python -m unittest discover -s tests
 - `app.py`：API 服务入口。
 - `model_app.py`：独立模型服务入口。
 - `desensitize/*.py`：脱敏、识别、远程调用、映射和配置代码。
-- `requirements-api.txt`、`requirements-model.txt`、`requirements.txt`：依赖入口。
+- `requirements-api.txt`、`requirements-model.txt`：依赖入口，分别用于 API 服务和模型服务。
 - `Dockerfile`、`.dockerignore`、`.gitignore`：容器构建和本地文件排除规则。
 - `example_preprocess_request.json`：综合联调示例。
 - `tests/test_service.py`：服务行为回归测试。

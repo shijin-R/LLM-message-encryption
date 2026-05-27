@@ -30,8 +30,8 @@ class ServiceConfig:
     model_path: Path
     # 模型推理设备 ID。
     device_id: int = 0
-    # 单条消息允许处理的最大长度。
-    max_text_len: int = 10000
+    # 单个识别分片允许处理的最大长度。
+    max_text_len: int = 512
     # 是否启用 PaddleNLP Taskflow wordtag 模型识别。
     enable_taskflow: bool = True
     # 严格模式：模型不可用时启动报错；本服务要求必须使用 Taskflow wordtag。
@@ -56,8 +56,6 @@ class ServiceConfig:
     downloaded_uie_model_cache_path: Path = (
         Path.home() / ".paddlenlp" / "taskflow" / "information_extraction" / "uie-base"
     )
-    # API 服务识别后端：默认 remote，避免业务 API 进程误加载本地模型。
-    recognizer_backend: str = "remote"
     # 独立模型服务地址。
     model_service_url: str = "http://127.0.0.1:18002"
     # API 调用模型服务的超时时间。
@@ -109,7 +107,7 @@ class ServiceConfig:
         return cls(
             model_path=model_path,
             device_id=int(os.getenv("DESENSITIZE_DEVICE_ID", "0")),
-            max_text_len=int(os.getenv("DESENSITIZE_MAX_TEXT_LEN", "10000")),
+            max_text_len=int(os.getenv("DESENSITIZE_MAX_TEXT_LEN", "512")),
             enable_taskflow=_env_to_bool("DESENSITIZE_ENABLE_TASKFLOW", True),
             strict_local_model=_env_to_bool("DESENSITIZE_STRICT_LOCAL_MODEL", True),
             auto_download_model=_env_to_bool("DESENSITIZE_AUTO_DOWNLOAD_MODEL", True),
@@ -121,9 +119,6 @@ class ServiceConfig:
             uie_position_prob=float(os.getenv("DESENSITIZE_UIE_POSITION_PROB", "0.5")),
             strict_uie_model=_env_to_bool("DESENSITIZE_STRICT_UIE_MODEL", False),
             downloaded_uie_model_cache_path=downloaded_uie_model_cache_path,
-            recognizer_backend=os.getenv("DESENSITIZE_RECOGNIZER_BACKEND", "remote")
-            .strip()
-            .lower(),
             model_service_url=os.getenv(
                 "DESENSITIZE_MODEL_SERVICE_URL",
                 "http://127.0.0.1:18002",

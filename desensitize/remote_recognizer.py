@@ -5,7 +5,7 @@ import urllib.error
 import urllib.request
 from typing import Any
 
-from .types import EntitySpan
+from .types import ModelSpan
 
 
 class RemoteRecognizerError(RuntimeError):
@@ -33,32 +33,18 @@ class HTTPRecognizerClient:
     def ready(self) -> dict[str, Any]:
         return self._request_json("GET", "/readyz")
 
-    def recognize(
+    def infer(
         self,
         text: str,
-        custom_entities: list[Any],
-    ) -> list[EntitySpan]:
+        tasks: dict[str, Any] | None = None,
+    ) -> list[ModelSpan]:
         payload = {
             "text": text,
-            "custom_entities": self._normalize_custom_entities(custom_entities),
+            "tasks": self._normalize_tasks(tasks),
         }
-        return self._request_spans("/v1/recognize", payload)
+        return self._request_spans("/v1/infer", payload)
 
-    def recognize_builtin(self, text: str) -> list[EntitySpan]:
-        return self._request_spans("/v1/recognize/builtin", {"text": text})
-
-    def recognize_custom(
-        self,
-        text: str,
-        custom_entities: list[Any],
-    ) -> list[EntitySpan]:
-        payload = {
-            "text": text,
-            "custom_entities": self._normalize_custom_entities(custom_entities),
-        }
-        return self._request_spans("/v1/recognize/custom", payload)
-
-    def _request_spans(self, path: str, payload: dict[str, Any]) -> list[EntitySpan]:
+    def _request_spans(self, path: str, payload: dict[str, Any]) -> list[ModelSpan]:
         data = self._request_json("POST", path, payload)
         return [self._span_from_dict(item) for item in data.get("spans", [])]
 
@@ -110,19 +96,28 @@ class HTTPRecognizerClient:
         return result
 
     @staticmethod
-    def _span_from_dict(item: Any) -> EntitySpan:
+    def _span_from_dict(item: Any) -> ModelSpan:
         if not isinstance(item, dict):
             raise RemoteRecognizerError("Model service span item must be an object.")
-        return EntitySpan(
-            entity_type=str(item.get("entity_type", "")),
+        probability = item.get("probability")
+        if not isinstance(probability, (int, float)):
+            probability = None
+        return ModelSpan(
+            label=str(item.get("label", "")),
             text=str(item.get("text", "")),
             start=int(item.get("start", -1)),
             end=int(item.get("end", -1)),
             source=str(item.get("source", "")),
+            probability=probability,
         )
 
     @staticmethod
-    def _normalize_custom_entities(value: Any) -> list[Any]:
-        if not isinstance(value, list):
-            return []
-        return value
+    def _normalize_tasks(value: Any) -> dict[str, Any]:
+        if not isinstance(value, dict):
+            return {"wordtag": True, "uie_schema": []}
+        return {
+            "wordtag": value.get("wordtag", True) is not False,
+            "uie_schema": value.get("uie_schema")
+            if isinstance(value.get("uie_schema"), list)
+            else [],
+        }

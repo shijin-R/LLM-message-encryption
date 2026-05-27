@@ -16,22 +16,21 @@
 业务系统 -> API 服务 app.py:18001 -> 模型服务 model_app.py:18002
 ```
 
-- API 服务：负责请求校验、历史 `mapping` 复用、冲突消解和占位符替换，默认通过 HTTP 调用模型服务，只需要 `requirements-api.txt`。
-- 模型服务：常驻加载 wordtag 和 `uie-base`，提供实体识别接口，可被多个 API 服务共享，需要 `requirements-model.txt`。
-- 单进程本地模式：仅建议本地调试使用，需要显式设置 `DESENSITIZE_RECOGNIZER_BACKEND=local`。
+- API 服务：应用层，负责请求校验、长文本分片、手机号正则补漏、`custom_entities` 解析、历史 `mapping` 复用、冲突消解和占位符替换，默认通过 HTTP 调用模型服务，只需要 `requirements-api.txt`。
+- 模型服务：纯推理层，常驻加载 wordtag 和 `uie-base`，只接收 `text` 与推理 `tasks`，返回模型原始标签片段，可被多个 API 服务共享，需要 `requirements-model.txt`。
 
 当前识别策略：
 
-- 内置实体：wordtag 模型 + 手机号规则补漏。
-- 自定义实体：全部交给 `uie-base`，通过 `custom_entities[].uie_schema` 声明抽取目标。
+- 内置实体：API 服务编排 wordtag 模型结果，并在应用层用手机号规则补漏。
+- 自定义实体：API 服务把 `custom_entities[].uie_schema` 转成模型服务的 UIE schema，再把模型标签映射回业务实体类型。
+- 长文本会在 API 服务识别编排前按 `DESENSITIZE_MAX_TEXT_LEN` 分片处理，默认每片 `512` 字符，并保留重叠区避免边界漏识别。
 - 除手机号外，不再执行自定义正则、固定值、字符串模式或 `model_labels` 匹配。
 
 ## 依赖与模型
 
 - 推荐 Python 3.10。
 - `requirements-api.txt`：API 服务轻量依赖。
-- `requirements-model.txt`：模型服务完整依赖，包含 PaddlePaddle 和 PaddleNLP。
-- `requirements.txt`：兼容入口，指向模型侧完整依赖。
+- `requirements-model.txt`：模型服务完整依赖，包含 API 依赖、PaddlePaddle 和 PaddleNLP。
 - wordtag 默认目录：`resources/models/wordtag`。
 - UIE 默认目录：`resources/models/uie-base`。
 
@@ -65,7 +64,6 @@ Invoke-RestMethod "http://127.0.0.1:18002/readyz" | ConvertTo-Json -Depth 10
 
 重点关注：
 
-- `recognizer_backend` 应为 `remote`。
 - `model_service_status` 应为 `ok`。
 - `model_service.using_taskflow` 应为 `true`。
 - `model_service.enable_uie_custom` 应为 `true`。
