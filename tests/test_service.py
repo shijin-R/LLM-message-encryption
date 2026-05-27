@@ -1,9 +1,15 @@
+from concurrent.futures import ThreadPoolExecutor
+import os
 from pathlib import Path
+import threading
+import time
 import unittest
+from unittest.mock import patch
 
 from desensitize.application_recognizer import ApplicationEntityRecognizer
 from desensitize.config import ServiceConfig
 from desensitize.recognizer import LocalEntityRecognizer
+from desensitize.remote_recognizer import HTTPRecognizerClient, RemoteRecognizerError
 from desensitize.service import DesensitizeService
 from desensitize.types import EntitySpan, ModelSpan
 
@@ -65,6 +71,30 @@ class FakeUIETaskflow:
         return [result]
 
 
+class SlowSchemaAwareUIETaskflow:
+    def __init__(self, output_by_label: dict[str, list[dict]]) -> None:
+        self.output_by_label = output_by_label
+        self.schema: list[str] = []
+        self.schema_pairs: list[tuple[tuple[str, ...], tuple[str, ...]]] = []
+        self._calls_lock = threading.Lock()
+
+    def set_schema(self, schema: list[str]) -> None:
+        self.schema = list(schema)
+
+    def __call__(self, text: str) -> list[dict]:
+        start_schema = tuple(self.schema)
+        time.sleep(0.02)
+        end_schema = tuple(self.schema)
+        with self._calls_lock:
+            self.schema_pairs.append((start_schema, end_schema))
+
+        result: dict[str, list[dict]] = {}
+        for label in end_schema:
+            if label in self.output_by_label:
+                result[label] = self.output_by_label[label]
+        return [result]
+
+
 class EmptyModelClient:
     using_taskflow = False
     using_uie = False
@@ -121,6 +151,35 @@ class RecordingModelClient:
     def infer(self, text: str, tasks: dict) -> list[ModelSpan]:
         self.calls.append(dict(tasks))
         return []
+
+
+class StubHTTPRecognizerClient(HTTPRecognizerClient):
+    def __init__(self, response_data: dict) -> None:
+        self.response_data = response_data
+
+    def _request_json(
+        self,
+        method: str,
+        path: str,
+        payload: dict | None = None,
+    ) -> dict:
+        return self.response_data
+
+
+class FakeHealthRecognizer:
+    using_taskflow = True
+    using_uie = True
+
+    def device_info(self) -> dict:
+        return {
+            "device": "nvidia",
+            "device_id": 1,
+            "taskflow_device_id": 1,
+            "gpu_available": True,
+            "gpu_device_count": 2,
+            "gpu_compiled_with_cuda": True,
+            "gpu_error": "",
+        }
 
 
 class CombinedRecognizer:
@@ -240,6 +299,70 @@ class DesensitizeServiceTest(unittest.TestCase):
         )
         self.assertEqual(result["mapping"]["PERSON"]["张三"], "[[PERSON_001]]")
         self.assertEqual(result["stats"]["processed_message_indexes"], [2])
+
+    def test_preprocess_mapping_is_request_scoped_under_concurrent_calls(self) -> None:
+        def run_request(messages: list[dict]) -> dict:
+            return self.service.prepare_llm_request(
+                {
+                    "llm_request": {
+                        "model": "demo",
+                        "messages": messages,
+                    }
+                }
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            future_with_history = executor.submit(
+                run_request,
+                [
+                    {
+                        "role": "user",
+                        "content": "历史联系人[[PERSON_009]]。",
+                        "encrypted": True,
+                        "mapping": {"PERSON": {"张三": "[[PERSON_009]]"}},
+                    },
+                    {
+                        "role": "user",
+                        "content": "本轮联系人张三，手机号13800138000。",
+                        "encrypted": False,
+                    },
+                ],
+            )
+            future_without_history = executor.submit(
+                run_request,
+                [
+                    {
+                        "role": "user",
+                        "content": "另一个会话联系人张三，手机号13800138000。",
+                        "encrypted": False,
+                    }
+                ],
+            )
+
+        result_with_history = future_with_history.result()
+        result_without_history = future_without_history.result()
+
+        self.assertEqual(
+            result_with_history["mapping"]["PERSON"]["张三"],
+            "[[PERSON_009]]",
+        )
+        self.assertEqual(
+            result_without_history["mapping"]["PERSON"]["张三"],
+            "[[PERSON_001]]",
+        )
+        self.assertEqual(
+            result_with_history["desensitized_request"]["messages"][1]["content"],
+            "本轮联系人[[PERSON_009]]，手机号[[MOBILE_001]]。",
+        )
+        self.assertEqual(
+            result_without_history["desensitized_request"]["messages"][0]["content"],
+            "另一个会话联系人[[PERSON_001]]，手机号[[MOBILE_001]]。",
+        )
+        self.assertEqual(result_with_history["stats"]["processed_message_indexes"], [1])
+        self.assertEqual(
+            result_without_history["stats"]["processed_message_indexes"],
+            [0],
+        )
 
     def test_unencrypted_message_mapping_is_not_used_as_history(self) -> None:
         result = self.preprocess(
@@ -491,6 +614,270 @@ class DesensitizeServiceTest(unittest.TestCase):
         self.assertEqual(spans[0].probability, 0.98)
         self.assertFalse(hasattr(spans[0], "entity_type"))
 
+    def test_model_infer_uie_serializes_schema_switch_and_inference(self) -> None:
+        fake_uie = SlowSchemaAwareUIETaskflow(
+            {
+                "身份证号": [
+                    {
+                        "text": "110101199003071234",
+                        "start": 6,
+                        "end": 24,
+                        "probability": 0.98,
+                    }
+                ],
+                "银行卡号": [
+                    {
+                        "text": "6222020202020202020",
+                        "start": 6,
+                        "end": 25,
+                        "probability": 0.97,
+                    }
+                ],
+            }
+        )
+        recognizer = LocalEntityRecognizer.__new__(LocalEntityRecognizer)
+        recognizer.enable_uie_custom = True
+        recognizer.strict_uie_model = True
+        recognizer._uie_taskflow = fake_uie
+        recognizer._uie_schema = ()
+        recognizer._uie_lock = threading.RLock()
+
+        def infer_label(text: str, label: str) -> list[ModelSpan]:
+            return recognizer.infer(
+                text,
+                {"wordtag": False, "uie_schema": [label]},
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            id_future = executor.submit(
+                infer_label,
+                "客户身份证号110101199003071234。",
+                "身份证号",
+            )
+            bank_future = executor.submit(
+                infer_label,
+                "客户银行卡号6222020202020202020。",
+                "银行卡号",
+            )
+
+        id_spans = id_future.result()
+        bank_spans = bank_future.result()
+
+        self.assertEqual(
+            [(span.label, span.text) for span in id_spans],
+            [("身份证号", "110101199003071234")],
+        )
+        self.assertEqual(
+            [(span.label, span.text) for span in bank_spans],
+            [("银行卡号", "6222020202020202020")],
+        )
+        self.assertEqual(
+            fake_uie.schema_pairs,
+            [(("身份证号",), ("身份证号",)), (("银行卡号",), ("银行卡号",))],
+        )
+
+    def test_cpu_device_uses_taskflow_cpu_id(self) -> None:
+        recognizer = LocalEntityRecognizer(
+            model_path=Path("resources/models/wordtag"),
+            device="cpu",
+            device_id=3,
+            enable_taskflow=False,
+            enable_uie_custom=False,
+            strict_local_model=False,
+        )
+
+        self.assertEqual(recognizer.device, "cpu")
+        self.assertEqual(recognizer.device_id, 3)
+        self.assertEqual(recognizer.taskflow_device_id, -1)
+        self.assertFalse(recognizer.gpu_available)
+
+    def test_nvidia_device_uses_configured_gpu_id_when_available(self) -> None:
+        status = {
+            "available": True,
+            "device_count": 2,
+            "compiled_with_cuda": True,
+            "error": "",
+        }
+
+        with patch.object(
+            LocalEntityRecognizer,
+            "_detect_nvidia_status",
+            return_value=status,
+        ):
+            recognizer = LocalEntityRecognizer(
+                model_path=Path("resources/models/wordtag"),
+                device="nvidia",
+                device_id=1,
+                enable_taskflow=False,
+                enable_uie_custom=False,
+                strict_local_model=False,
+            )
+
+        self.assertEqual(recognizer.device, "nvidia")
+        self.assertEqual(recognizer.taskflow_device_id, 1)
+        self.assertTrue(recognizer.gpu_available)
+        self.assertEqual(recognizer.gpu_device_count, 2)
+
+    def test_nvidia_device_fails_when_paddle_is_not_cuda_build(self) -> None:
+        status = {
+            "available": False,
+            "device_count": 0,
+            "compiled_with_cuda": False,
+            "error": "paddle is cpu only",
+        }
+
+        with patch.object(
+            LocalEntityRecognizer,
+            "_detect_nvidia_status",
+            return_value=status,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "paddlepaddle-gpu"):
+                LocalEntityRecognizer(
+                    model_path=Path("resources/models/wordtag"),
+                    device="nvidia",
+                    enable_taskflow=False,
+                    enable_uie_custom=False,
+                    strict_local_model=False,
+                )
+
+    def test_nvidia_device_fails_when_no_gpu_is_visible(self) -> None:
+        status = {
+            "available": False,
+            "device_count": 0,
+            "compiled_with_cuda": True,
+            "error": "",
+        }
+
+        with patch.object(
+            LocalEntityRecognizer,
+            "_detect_nvidia_status",
+            return_value=status,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "at least one visible"):
+                LocalEntityRecognizer(
+                    model_path=Path("resources/models/wordtag"),
+                    device="nvidia",
+                    enable_taskflow=False,
+                    enable_uie_custom=False,
+                    strict_local_model=False,
+                )
+
+    def test_nvidia_device_fails_when_device_id_is_out_of_range(self) -> None:
+        status = {
+            "available": True,
+            "device_count": 1,
+            "compiled_with_cuda": True,
+            "error": "",
+        }
+
+        with patch.object(
+            LocalEntityRecognizer,
+            "_detect_nvidia_status",
+            return_value=status,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "out of range"):
+                LocalEntityRecognizer(
+                    model_path=Path("resources/models/wordtag"),
+                    device="nvidia",
+                    device_id=2,
+                    enable_taskflow=False,
+                    enable_uie_custom=False,
+                    strict_local_model=False,
+                )
+
+    def test_taskflow_creation_receives_resolved_device_id(self) -> None:
+        calls: list[dict] = []
+
+        class CapturingTaskflow:
+            def __init__(self, *args, **kwargs) -> None:
+                calls.append(kwargs)
+
+        recognizer = LocalEntityRecognizer.__new__(LocalEntityRecognizer)
+        recognizer.taskflow_device_id = -1
+        recognizer._create_wordtag_taskflow(CapturingTaskflow)
+
+        recognizer.taskflow_device_id = 1
+        recognizer.uie_model_name = "uie-base"
+        recognizer.uie_position_prob = 0.5
+        recognizer._create_uie_taskflow(CapturingTaskflow, schema=["身份证号"])
+
+        self.assertEqual(calls[0]["device_id"], -1)
+        self.assertEqual(calls[1]["device_id"], 1)
+
+    def test_model_healthz_returns_device_status(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "DESENSITIZE_DEVICE": "cpu",
+                "DESENSITIZE_ENABLE_TASKFLOW": "false",
+                "DESENSITIZE_ENABLE_UIE_CUSTOM": "false",
+                "DESENSITIZE_PRELOAD_UIE_CUSTOM": "false",
+                "DESENSITIZE_STRICT_LOCAL_MODEL": "false",
+            },
+        ):
+            from model_app import create_model_app
+
+        config = ServiceConfig(
+            model_path=Path("resources/models/wordtag"),
+            device="nvidia",
+            device_id=1,
+            enable_taskflow=False,
+            enable_uie_custom=False,
+            preload_uie_custom=False,
+            strict_local_model=False,
+        )
+        app = create_model_app(config=config, recognizer=FakeHealthRecognizer())
+
+        response = app.test_client().get("/healthz")
+        data = response.get_json()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(data["device"], "nvidia")
+        self.assertEqual(data["device_id"], 1)
+        self.assertEqual(data["taskflow_device_id"], 1)
+        self.assertTrue(data["gpu_available"])
+        self.assertEqual(data["gpu_device_count"], 2)
+        self.assertTrue(data["gpu_compiled_with_cuda"])
+
+    def test_config_reads_and_validates_device(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"DESENSITIZE_DEVICE": "nvidia", "DESENSITIZE_DEVICE_ID": "2"},
+        ):
+            config = ServiceConfig.from_env()
+
+        self.assertEqual(config.device, "nvidia")
+        self.assertEqual(config.device_id, 2)
+
+        with patch.dict(os.environ, {"DESENSITIZE_DEVICE": "amd"}):
+            with self.assertRaisesRegex(ValueError, "cpu, nvidia"):
+                ServiceConfig.from_env()
+
+    def test_downloaded_model_sync_is_disabled_by_default(self) -> None:
+        config = ServiceConfig(model_path=Path("resources/models/wordtag"))
+
+        self.assertFalse(config.sync_downloaded_model)
+
+    def test_downloaded_model_sync_respects_flag(self) -> None:
+        recognizer = LocalEntityRecognizer.__new__(LocalEntityRecognizer)
+        recognizer.downloaded_model_cache_path = Path("cache/wordtag")
+        recognizer.model_path = Path("resources/models/wordtag")
+        calls: list[tuple[Path, Path]] = []
+        recognizer._sync_model_directory = lambda source, target: calls.append(
+            (source, target)
+        )
+
+        recognizer.sync_downloaded_model = False
+        recognizer._sync_downloaded_model_to_local()
+        self.assertEqual(calls, [])
+
+        recognizer.sync_downloaded_model = True
+        recognizer._sync_downloaded_model_to_local()
+        self.assertEqual(
+            calls,
+            [(Path("cache/wordtag"), Path("resources/models/wordtag"))],
+        )
+
     def test_application_maps_wordtag_labels_to_business_entities(self) -> None:
         text = "联系人张三来自上海泛微网络科技股份有限公司。"
         person = "张三"
@@ -664,6 +1051,61 @@ class DesensitizeServiceTest(unittest.TestCase):
                 ("BANK_CARD", "6222020202020202020", "custom"),
             ],
         )
+
+    def test_custom_uie_prefers_exact_label_when_schema_names_overlap(self) -> None:
+        bank_card = "6222020202020202020"
+        text = f"客户银行卡号{bank_card}。"
+        recognizer = ApplicationEntityRecognizer(
+            StaticModelClient(
+                [
+                    ModelSpan(
+                        "银行卡号",
+                        bank_card,
+                        text.find(bank_card),
+                        text.find(bank_card) + len(bank_card),
+                        "uie",
+                        0.97,
+                    ),
+                ]
+            )
+        )
+
+        spans = recognizer.recognize(
+            text,
+            [
+                {"entity_type": "CARD", "uie_schema": ["卡号"]},
+                {"entity_type": "BANK_CARD", "uie_schema": ["银行卡号"]},
+            ],
+        )
+
+        self.assertEqual(
+            [(span.entity_type, span.text) for span in spans],
+            [("BANK_CARD", bank_card)],
+        )
+
+    def test_remote_client_rejects_invalid_spans_as_model_service_error(self) -> None:
+        client = StubHTTPRecognizerClient(
+            {
+                "spans": [
+                    {
+                        "label": "身份证号",
+                        "text": "110101199003071234",
+                        "start": "bad",
+                        "end": 24,
+                        "source": "uie",
+                    }
+                ]
+            }
+        )
+
+        with self.assertRaises(RemoteRecognizerError):
+            client.infer("客户身份证号110101199003071234。")
+
+    def test_remote_client_requires_spans_to_be_a_list(self) -> None:
+        client = StubHTTPRecognizerClient({"spans": "bad"})
+
+        with self.assertRaises(RemoteRecognizerError):
+            client.infer("任意文本")
 
     def test_preprocess_masks_uie_custom_id_card_and_bank_card(self) -> None:
         text = "客户身份证号110101199003071234，银行卡号6222020202020202020。"

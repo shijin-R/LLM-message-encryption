@@ -46,7 +46,10 @@ class HTTPRecognizerClient:
 
     def _request_spans(self, path: str, payload: dict[str, Any]) -> list[ModelSpan]:
         data = self._request_json("POST", path, payload)
-        return [self._span_from_dict(item) for item in data.get("spans", [])]
+        spans = data.get("spans", [])
+        if not isinstance(spans, list):
+            raise RemoteRecognizerError("Model service `spans` must be a list.")
+        return [self._span_from_dict(item) for item in spans]
 
     def _request_json(
         self,
@@ -105,11 +108,21 @@ class HTTPRecognizerClient:
         return ModelSpan(
             label=str(item.get("label", "")),
             text=str(item.get("text", "")),
-            start=int(item.get("start", -1)),
-            end=int(item.get("end", -1)),
+            start=HTTPRecognizerClient._span_index(item, "start"),
+            end=HTTPRecognizerClient._span_index(item, "end"),
             source=str(item.get("source", "")),
             probability=probability,
         )
+
+    @staticmethod
+    def _span_index(item: dict[str, Any], field: str) -> int:
+        """把模型服务返回的坐标转成整数；坏数据统一归为远程服务错误。"""
+        try:
+            return int(item.get(field, -1))
+        except (TypeError, ValueError) as exc:
+            raise RemoteRecognizerError(
+                f"Model service span `{field}` must be an integer."
+            ) from exc
 
     @staticmethod
     def _normalize_tasks(value: Any) -> dict[str, Any]:

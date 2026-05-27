@@ -37,27 +37,27 @@ def create_model_app(
     @app.get("/healthz")
     def healthz():
         # 健康检查偏向“配置和当前状态展示”，即使模型暂未完全 ready 也返回服务状态。
-        return jsonify(
-            {
-                "status": "ok",
-                "model_path": str(config.model_path),
-                "strict_local_model": config.strict_local_model,
-                "enable_taskflow": config.enable_taskflow,
-                "auto_download_model": config.auto_download_model,
-                "sync_downloaded_model": config.sync_downloaded_model,
-                "model_cache_path": str(config.downloaded_model_cache_path),
-                "using_taskflow": recognizer.using_taskflow,
-                "enable_uie_custom": config.enable_uie_custom,
-                "preload_uie_custom": config.preload_uie_custom,
-                "uie_warmup_schema": list(config.uie_warmup_schema),
-                "uie_model_name": config.uie_model_name,
-                "uie_model_path": str(config.uie_model_path),
-                "uie_position_prob": config.uie_position_prob,
-                "strict_uie_model": config.strict_uie_model,
-                "uie_model_cache_path": str(config.downloaded_uie_model_cache_path),
-                "using_uie": recognizer.using_uie,
-            }
-        )
+        payload = {
+            "status": "ok",
+            "model_path": str(config.model_path),
+            "strict_local_model": config.strict_local_model,
+            "enable_taskflow": config.enable_taskflow,
+            "auto_download_model": config.auto_download_model,
+            "sync_downloaded_model": config.sync_downloaded_model,
+            "model_cache_path": str(config.downloaded_model_cache_path),
+            "using_taskflow": recognizer.using_taskflow,
+            "enable_uie_custom": config.enable_uie_custom,
+            "preload_uie_custom": config.preload_uie_custom,
+            "uie_warmup_schema": list(config.uie_warmup_schema),
+            "uie_model_name": config.uie_model_name,
+            "uie_model_path": str(config.uie_model_path),
+            "uie_position_prob": config.uie_position_prob,
+            "strict_uie_model": config.strict_uie_model,
+            "uie_model_cache_path": str(config.downloaded_uie_model_cache_path),
+            "using_uie": recognizer.using_uie,
+        }
+        payload.update(_device_health(config, recognizer))
+        return jsonify(payload)
 
     @app.get("/readyz")
     def readyz():
@@ -135,6 +135,21 @@ def _get_tasks(payload: dict[str, Any]) -> dict[str, Any]:
         "uie_schema": tasks.get("uie_schema")
         if isinstance(tasks.get("uie_schema"), list)
         else [],
+    }
+
+
+def _device_health(config: ServiceConfig, recognizer: Any) -> dict[str, Any]:
+    """汇总设备状态；真实值优先来自模型识别器，避免只展示配置。"""
+    if hasattr(recognizer, "device_info"):
+        return dict(recognizer.device_info())
+    return {
+        "device": config.device,
+        "device_id": config.device_id,
+        "taskflow_device_id": config.device_id if config.device == "nvidia" else -1,
+        "gpu_available": False,
+        "gpu_device_count": 0,
+        "gpu_compiled_with_cuda": False,
+        "gpu_error": "",
     }
 
 

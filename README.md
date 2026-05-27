@@ -17,7 +17,9 @@
 ```
 
 - API 服务：应用层，负责请求校验、长文本分片、手机号正则补漏、`custom_entities` 解析、历史 `mapping` 复用、冲突消解和占位符替换，默认通过 HTTP 调用模型服务，只需要 `requirements-api.txt`。
-- 模型服务：纯推理层，常驻加载 wordtag 和 `uie-base`，只接收 `text` 与推理 `tasks`，返回模型原始标签片段，可被多个 API 服务共享，需要 `requirements-model.txt`。
+- 模型服务：纯推理层，常驻加载 wordtag 和 `uie-base`，只接收 `text` 与推理 `tasks`，返回模型原始标签片段，可被多个 API 服务共享；CPU 依赖使用 `requirements-model.txt`，NVIDIA GPU 依赖使用 `requirements-model-nvidia.txt`。
+- API 服务不保存会话状态，可部署多个容器或多台服务器并通过负载均衡访问，不需要 sticky session。
+- 模型服务可部署多个实例；默认自动下载到各容器私有缓存，不把下载结果写回共享模型目录，避免多容器抢写。
 
 当前识别策略：
 
@@ -31,6 +33,7 @@
 - 推荐 Python 3.10。
 - `requirements-api.txt`：API 服务轻量依赖。
 - `requirements-model.txt`：模型服务完整依赖，包含 API 依赖、PaddlePaddle 和 PaddleNLP。
+- `requirements-model-nvidia.txt`：NVIDIA/CUDA 11.8 模型服务依赖，使用 `paddlepaddle-gpu==2.6.1`。
 - wordtag 默认目录：`resources/models/wordtag`。
 - UIE 默认目录：`resources/models/uie-base`。
 
@@ -59,6 +62,7 @@ python -u app.py
 ```powershell
 Invoke-RestMethod "http://127.0.0.1:18001/healthz" | ConvertTo-Json -Depth 10
 Invoke-RestMethod "http://127.0.0.1:18001/readyz" | ConvertTo-Json -Depth 10
+Invoke-RestMethod "http://127.0.0.1:18002/healthz" | ConvertTo-Json -Depth 10
 Invoke-RestMethod "http://127.0.0.1:18002/readyz" | ConvertTo-Json -Depth 10
 ```
 
@@ -68,6 +72,7 @@ Invoke-RestMethod "http://127.0.0.1:18002/readyz" | ConvertTo-Json -Depth 10
 - `model_service.using_taskflow` 应为 `true`。
 - `model_service.enable_uie_custom` 应为 `true`。
 - 开启 UIE 预加载时，`model_service.using_uie` 应为 `true`。
+- NVIDIA GPU 模式下，模型服务 `/healthz` 中 `device` 应为 `nvidia`，`gpu_available` 应为 `true`。
 
 ## Docker 快速部署
 
@@ -76,6 +81,12 @@ Invoke-RestMethod "http://127.0.0.1:18002/readyz" | ConvertTo-Json -Depth 10
 ```powershell
 docker build --target model -t llm-messages-encryptor-model:latest .
 docker build --target api -t llm-messages-encryptor-api:latest .
+```
+
+如果模型服务要使用 NVIDIA GPU，构建 GPU target，API 镜像不变：
+
+```powershell
+docker build --target model-nvidia -t llm-messages-encryptor-model-nvidia:latest .
 ```
 
 同一台 Docker 主机部署时，两个容器加入同一个 Docker network，API 服务可通过模型容器名访问模型服务：
@@ -102,6 +113,30 @@ docker run -d `
   -e DESENSITIZE_MODEL_SERVICE_URL=http://llm-messages-encryptor-model:18002 `
   --name llm-messages-encryptor-api `
   llm-messages-encryptor-api:latest
+```
+
+NVIDIA GPU 模型容器需要宿主机安装 NVIDIA 驱动和 NVIDIA Container Toolkit，并在启动时显式授权 GPU：
+
+```powershell
+docker run -d `
+  --gpus all `
+  --restart unless-stopped `
+  --network llm_messages_encryptor_net `
+  -e MODEL_HOST=0.0.0.0 `
+  -e MODEL_PORT=18002 `
+  -e DESENSITIZE_DEVICE_ID=0 `
+  --name llm-messages-encryptor-model `
+  llm-messages-encryptor-model-nvidia:latest
+
+docker run -d `
+  --gpus '"device=0"' `
+  --restart unless-stopped `
+  --network llm_messages_encryptor_net `
+  -e MODEL_HOST=0.0.0.0 `
+  -e MODEL_PORT=18002 `
+  -e DESENSITIZE_DEVICE_ID=0 `
+  --name llm-messages-encryptor-model-gpu0 `
+  llm-messages-encryptor-model-nvidia:latest
 ```
 
 跨主机部署时，普通 Docker network 不能跨主机使用容器名，API 服务应配置模型服务机器的内网 IP 或内网 DNS：
@@ -187,6 +222,6 @@ Invoke-RestMethod `
 - 模型下载、模型挂载和 UIE 预加载都由模型服务侧负责。
 - 如果身份证号、银行卡号或地址未脱敏，先检查 `/healthz` 中的 `model_service.enable_uie_custom` 和 `model_service.using_uie`。
 - 服务是无状态的，调用方必须保存 `data.mapping`，并在下一轮历史 `user` 消息中携带该映射和 `encrypted=true`。
-- 内网或离线环境需要提前准备模型文件，或为模型服务挂载包含模型文件的 Docker volume。
+- 内网或离线环境需要提前准备模型文件，或为模型服务挂载包含模型文件的只读 Docker volume。
 
 更多本地调试、模型准备和仓库瘦身规则见 [开发、部署与模型准备](docs/local-development.md)。

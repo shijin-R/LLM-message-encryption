@@ -75,7 +75,7 @@ class ApplicationEntityRecognizer:
         if not text:
             return []
 
-        uie_rules, uie_schema = self._normalize_custom_uie_rules(custom_entities)
+        uie_rules, uie_schema = self._parse_custom_uie_rules(custom_entities)
         spans: list[EntitySpan] = []
         for model_span in self._infer_chunks(text, wordtag=True, uie_schema=uie_schema):
             entity_span = self._model_span_to_entity(text, model_span, uie_rules)
@@ -92,6 +92,7 @@ class ApplicationEntityRecognizer:
         wordtag: bool,
         uie_schema: list[str],
     ) -> Iterator[ModelSpan]:
+        # 这里只切分“识别输入”，不拆业务消息；返回 span 时统一回填到全文坐标。
         for offset, chunk in self._iter_text_chunks(text):
             spans = self.model_client.infer(
                 chunk,
@@ -140,7 +141,7 @@ class ApplicationEntityRecognizer:
         span: ModelSpan,
         rules: list[tuple[str, set[str]]],
     ) -> EntitySpan | None:
-        entity_type = self._match_custom_entity_type(span.label, rules)
+        entity_type = self._match_uie_label_entity_type(span.label, rules)
         if not entity_type:
             return None
 
@@ -200,10 +201,11 @@ class ApplicationEntityRecognizer:
             )
         return spans
 
-    def _normalize_custom_uie_rules(
+    def _parse_custom_uie_rules(
         self,
         custom_entities: list[Any],
     ) -> tuple[list[tuple[str, set[str]]], list[str]]:
+        """解析 custom_entities，返回业务映射规则和需要下发给模型层的 UIE schema。"""
         if not isinstance(custom_entities, list):
             return [], []
 
@@ -218,7 +220,7 @@ class ApplicationEntityRecognizer:
             raw_entity_type = rule.get("entity_type", rule.get("type", "CUSTOM"))
             entity_type = normalize_entity_type(raw_entity_type)
             raw_labels = list(
-                self._iter_label_values(
+                self._iter_schema_labels(
                     rule.get("uie_schema")
                     or rule.get("uie_labels")
                     or rule.get("uie_label")
@@ -244,24 +246,30 @@ class ApplicationEntityRecognizer:
         return rules, schema
 
     @classmethod
-    def _match_custom_entity_type(
+    def _match_uie_label_entity_type(
         cls,
         tag: str,
         rules: list[tuple[str, set[str]]],
     ) -> str:
+        """把 UIE label 映射成业务实体类型；先精确匹配，再用最长 label 模糊匹配。"""
         normalized_tag = cls._normalize_label(tag)
         if not normalized_tag:
             return ""
 
         for entity_type, labels in rules:
-            if any(
-                label == normalized_tag
-                or label in normalized_tag
-                or normalized_tag in label
-                for label in labels
-            ):
+            if normalized_tag in labels:
                 return entity_type
-        return ""
+
+        best_type = ""
+        best_label_len = -1
+        for entity_type, labels in rules:
+            for label in labels:
+                if label in normalized_tag or normalized_tag in label:
+                    # 同样长度时保留 custom_entities 中更靠前的规则，避免结果被字典序影响。
+                    if len(label) > best_label_len:
+                        best_type = entity_type
+                        best_label_len = len(label)
+        return best_type
 
     @classmethod
     def _is_person_tag(cls, tag: str) -> bool:
@@ -400,7 +408,8 @@ class ApplicationEntityRecognizer:
         return re.sub(r"\s+", "", normalized)
 
     @staticmethod
-    def _ensure_list(value: Any) -> list[Any]:
+    def _as_list(value: Any) -> list[Any]:
+        """把 schema 的多种写法统一成列表，便于后续逐项抽取 label。"""
         if isinstance(value, list):
             return value
         if isinstance(value, tuple):
@@ -418,8 +427,9 @@ class ApplicationEntityRecognizer:
         return [value]
 
     @classmethod
-    def _iter_label_values(cls, value: Any) -> Iterator[Any]:
-        for item in cls._ensure_list(value):
+    def _iter_schema_labels(cls, value: Any) -> Iterator[Any]:
+        """从字符串、字典或列表形式的 uie_schema 中逐个取出 label。"""
+        for item in cls._as_list(value):
             if isinstance(item, dict):
                 label = (
                     item.get("name")

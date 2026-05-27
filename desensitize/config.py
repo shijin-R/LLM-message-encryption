@@ -22,13 +22,25 @@ def _env_to_tuple(name: str, default: tuple[str, ...]) -> tuple[str, ...]:
     return tuple(item.strip() for item in raw.split(",") if item.strip())
 
 
+def _env_to_device(name: str, default: str) -> str:
+    """读取推理设备类型；首版只支持 CPU 和 NVIDIA CUDA。"""
+    device = os.getenv(name, default).strip().lower()
+    if device not in {"cpu", "nvidia"}:
+        raise ValueError(
+            f"{name} must be one of: cpu, nvidia. got={device!r}"
+        )
+    return device
+
+
 @dataclass(frozen=True)
 class ServiceConfig:
     """脱敏服务运行配置。"""
 
     # 本地模型目录（优先加载）。
     model_path: Path
-    # 模型推理设备 ID。
+    # 模型推理设备类型；首版只支持 cpu 和 nvidia。
+    device: str = "cpu"
+    # NVIDIA GPU 编号；CPU 模式下会转换为 PaddleNLP 的 -1。
     device_id: int = 0
     # 单个识别分片允许处理的最大长度。
     max_text_len: int = 512
@@ -38,8 +50,8 @@ class ServiceConfig:
     strict_local_model: bool = True
     # 本地模型缺失时是否允许自动下载默认模型。
     auto_download_model: bool = True
-    # 自动下载后是否同步回本地模型目录。
-    sync_downloaded_model: bool = True
+    # 自动下载后是否同步回本地模型目录；生产多容器默认使用各容器私有缓存，避免共享目录抢写。
+    sync_downloaded_model: bool = False
     # PaddleNLP 默认下载缓存目录。
     downloaded_model_cache_path: Path = Path.home() / ".paddlenlp" / "taskflow" / "wordtag"
     # 是否启用 UIE 信息抽取旁路识别业务自定义实体。
@@ -106,12 +118,13 @@ class ServiceConfig:
 
         return cls(
             model_path=model_path,
+            device=_env_to_device("DESENSITIZE_DEVICE", "cpu"),
             device_id=int(os.getenv("DESENSITIZE_DEVICE_ID", "0")),
             max_text_len=int(os.getenv("DESENSITIZE_MAX_TEXT_LEN", "512")),
             enable_taskflow=_env_to_bool("DESENSITIZE_ENABLE_TASKFLOW", True),
             strict_local_model=_env_to_bool("DESENSITIZE_STRICT_LOCAL_MODEL", True),
             auto_download_model=_env_to_bool("DESENSITIZE_AUTO_DOWNLOAD_MODEL", True),
-            sync_downloaded_model=_env_to_bool("DESENSITIZE_SYNC_DOWNLOADED_MODEL", True),
+            sync_downloaded_model=_env_to_bool("DESENSITIZE_SYNC_DOWNLOADED_MODEL", False),
             downloaded_model_cache_path=downloaded_model_cache_path,
             enable_uie_custom=_env_to_bool("DESENSITIZE_ENABLE_UIE_CUSTOM", True),
             uie_model_name=uie_model_name,

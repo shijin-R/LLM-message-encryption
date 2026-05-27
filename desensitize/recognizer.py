@@ -25,15 +25,17 @@ class LocalEntityRecognizer:
     UIE_TASKFLOW_TASK = "information_extraction"
     WORDTAG_SOURCE = "wordtag"
     UIE_SOURCE = "uie"
+    SUPPORTED_DEVICES = {"cpu", "nvidia"}
 
     def __init__(
         self,
         model_path: Path,
+        device: str = "cpu",
         device_id: int = 0,
         enable_taskflow: bool = True,
         strict_local_model: bool = True,
         auto_download_model: bool = True,
-        sync_downloaded_model: bool = True,
+        sync_downloaded_model: bool = False,
         downloaded_model_cache_path: Path | None = None,
         enable_uie_custom: bool = True,
         uie_model_name: str = "uie-base",
@@ -44,7 +46,13 @@ class LocalEntityRecognizer:
     ) -> None:
         # 初始化识别器配置。
         self.model_path = Path(model_path)
-        self.device_id = device_id
+        self.device = self._normalize_device(device)
+        self.device_id = int(device_id)
+        self._gpu_status = self._detect_nvidia_status()
+        if self.device == "nvidia":
+            self._ensure_nvidia_ready()
+        # PaddleNLP Taskflow 约定 CPU 使用 -1，GPU 使用具体卡号。
+        self.taskflow_device_id = self.device_id if self.device == "nvidia" else -1
         self.enable_taskflow = enable_taskflow
         self.strict_local_model = strict_local_model
         self.auto_download_model = auto_download_model
@@ -87,6 +95,112 @@ class LocalEntityRecognizer:
     def using_uie(self) -> bool:
         """当前进程是否已懒加载 UIE 信息抽取旁路。"""
         return self._uie_taskflow is not None
+
+    @property
+    def gpu_available(self) -> bool:
+        """NVIDIA GPU 是否可被当前 Paddle 运行时使用。"""
+        return bool(self._gpu_status.get("available", False))
+
+    @property
+    def gpu_device_count(self) -> int:
+        """当前 Paddle 运行时能看到的 NVIDIA GPU 数量。"""
+        return int(self._gpu_status.get("device_count", 0))
+
+    @property
+    def gpu_compiled_with_cuda(self) -> bool:
+        """当前安装的 Paddle 是否为 CUDA 版本。"""
+        return bool(self._gpu_status.get("compiled_with_cuda", False))
+
+    @property
+    def gpu_error(self) -> str:
+        """GPU 检测失败时的错误信息，便于健康检查排查环境。"""
+        return str(self._gpu_status.get("error", ""))
+
+    def device_info(self) -> dict[str, Any]:
+        """返回健康检查需要展示的推理设备状态。"""
+        return {
+            "device": self.device,
+            "device_id": self.device_id,
+            "taskflow_device_id": self.taskflow_device_id,
+            "gpu_available": self.gpu_available,
+            "gpu_device_count": self.gpu_device_count,
+            "gpu_compiled_with_cuda": self.gpu_compiled_with_cuda,
+            "gpu_error": self.gpu_error,
+        }
+
+    @classmethod
+    def _normalize_device(cls, device: Any) -> str:
+        normalized = str(device or "cpu").strip().lower()
+        if normalized not in cls.SUPPORTED_DEVICES:
+            raise ValueError(
+                "DESENSITIZE_DEVICE must be one of: cpu, nvidia. "
+                f"got={normalized!r}"
+            )
+        return normalized
+
+    def _detect_nvidia_status(self) -> dict[str, Any]:
+        """检测 NVIDIA CUDA 能力；CPU 模式不导入 Paddle，避免影响轻量测试。"""
+        if self.device != "nvidia":
+            return {
+                "available": False,
+                "device_count": 0,
+                "compiled_with_cuda": False,
+                "error": "",
+            }
+
+        try:
+            import paddle
+        except Exception as exc:
+            return {
+                "available": False,
+                "device_count": 0,
+                "compiled_with_cuda": False,
+                "error": str(exc),
+            }
+
+        try:
+            compiled_with_cuda = bool(paddle.is_compiled_with_cuda())
+            device_count = self._read_paddle_gpu_count(paddle) if compiled_with_cuda else 0
+            return {
+                "available": compiled_with_cuda and device_count > 0,
+                "device_count": device_count,
+                "compiled_with_cuda": compiled_with_cuda,
+                "error": "",
+            }
+        except Exception as exc:
+            return {
+                "available": False,
+                "device_count": 0,
+                "compiled_with_cuda": False,
+                "error": str(exc),
+            }
+
+    @staticmethod
+    def _read_paddle_gpu_count(paddle_module: Any) -> int:
+        cuda = getattr(getattr(paddle_module, "device", None), "cuda", None)
+        for method_name in ("device_count", "get_device_count"):
+            device_count = getattr(cuda, method_name, None)
+            if callable(device_count):
+                return max(0, int(device_count()))
+        return 0
+
+    def _ensure_nvidia_ready(self) -> None:
+        """NVIDIA 模式采用严格启动：环境不满足就失败，避免生产静默跑 CPU。"""
+        if not self.gpu_compiled_with_cuda:
+            detail = f" Detail: {self.gpu_error}" if self.gpu_error else ""
+            raise RuntimeError(
+                "DESENSITIZE_DEVICE=nvidia requires paddlepaddle-gpu with CUDA."
+                + detail
+            )
+        if self.gpu_device_count <= 0:
+            raise RuntimeError(
+                "DESENSITIZE_DEVICE=nvidia requires at least one visible NVIDIA GPU."
+            )
+        if self.device_id < 0 or self.device_id >= self.gpu_device_count:
+            raise RuntimeError(
+                "DESENSITIZE_DEVICE_ID is out of range for visible NVIDIA GPUs. "
+                f"device_id={self.device_id}, gpu_device_count={self.gpu_device_count}."
+            )
 
     def _has_local_model_files(self, model_path: Path | None = None) -> bool:
         """判断本地模型目录是否存在可用模型文件。"""
@@ -195,7 +309,7 @@ class LocalEntityRecognizer:
         return taskflow_cls(
             self.TASKFLOW_TASK,
             entity_only=True,
-            device_id=self.device_id,
+            device_id=self.taskflow_device_id,
             **kwargs,
         )
 
@@ -320,7 +434,7 @@ class LocalEntityRecognizer:
             self.UIE_TASKFLOW_TASK,
             schema=schema,
             model=self.uie_model_name,
-            device_id=self.device_id,
+            device_id=self.taskflow_device_id,
             position_prob=self.uie_position_prob,
             **kwargs,
         )
@@ -328,6 +442,7 @@ class LocalEntityRecognizer:
     def _sync_downloaded_model_to_local(self) -> None:
         """把自动下载的模型同步到项目本地模型目录。"""
         if not self.sync_downloaded_model:
+            # 多容器部署时默认使用各容器自己的 PaddleNLP 缓存，避免多个容器同时写共享模型目录。
             return
 
         source_dir = self.downloaded_model_cache_path
@@ -336,6 +451,7 @@ class LocalEntityRecognizer:
     def _sync_downloaded_uie_model_to_local(self) -> None:
         """把自动下载的 UIE 模型同步到项目本地模型目录。"""
         if not self.sync_downloaded_model:
+            # 多容器部署时默认使用各容器自己的 PaddleNLP 缓存，避免多个容器同时写共享模型目录。
             return
 
         source_dir = self._find_downloaded_uie_model_cache_path()
@@ -458,6 +574,8 @@ class LocalEntityRecognizer:
         """按 schema 从 UIE 输出中抽取模型标签片段。"""
         lock = getattr(self, "_uie_lock", nullcontext())
         with lock:
+            # UIE Taskflow 的 schema 是实例级可变状态；set_schema 和推理必须作为一个临界区。
+            # 否则多线程请求不同 uie_schema 时，后一个请求可能在前一个请求推理中途切换 schema。
             uie_taskflow = self._ensure_uie_taskflow(schema)
             if uie_taskflow is None:
                 return []

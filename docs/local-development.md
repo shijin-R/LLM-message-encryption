@@ -46,6 +46,12 @@ python -m venv .venv
 python -m pip install -r requirements-model.txt
 ```
 
+NVIDIA GPU 模型服务使用单独依赖入口，首版锁定 CUDA 11.8 路线：
+
+```powershell
+python -m pip install -r requirements-model-nvidia.txt -i https://mirror.baidu.com/pypi/simple
+```
+
 如果只启动 API 服务并连接远程模型服务，可以只安装轻量依赖：
 
 ```powershell
@@ -66,11 +72,12 @@ python -m pip install -r requirements-api.txt
 | `DESENSITIZE_PRELOAD_UIE_CUSTOM` | `true` | 模型服务启动时是否预加载 UIE |
 | `DESENSITIZE_UIE_WARMUP_SCHEMA` | `身份证号,卡号,银行卡号,地址,住址` | UIE 预热 schema，逗号分隔 |
 | `DESENSITIZE_AUTO_DOWNLOAD_MODEL` | `true` | 本地模型缺失时是否尝试自动下载 |
-| `DESENSITIZE_SYNC_DOWNLOADED_MODEL` | `true` | 自动下载后是否同步回本地模型目录 |
+| `DESENSITIZE_SYNC_DOWNLOADED_MODEL` | `false` | 自动下载后是否同步回本地模型目录；生产多容器默认使用各容器私有缓存 |
 | `DESENSITIZE_STRICT_LOCAL_MODEL` | `true` | wordtag 模型不可用时是否启动失败 |
 | `DESENSITIZE_STRICT_UIE_MODEL` | `false` | UIE 不可用时是否抛错 |
 | `DESENSITIZE_MAX_TEXT_LEN` | `512` | API 应用层单个识别分片最大长度；超出后会自动分片并合并识别结果 |
-| `DESENSITIZE_DEVICE_ID` | `0` | PaddleNLP 推理设备 ID |
+| `DESENSITIZE_DEVICE` | `cpu` | 模型服务推理设备类型，首版只支持 `cpu` 或 `nvidia` |
+| `DESENSITIZE_DEVICE_ID` | `0` | NVIDIA GPU 编号；CPU 模式下会传给 PaddleNLP `-1` |
 | `DESENSITIZE_UIE_POSITION_PROB` | `0.5` | UIE 起止位置概率阈值 |
 
 ## 本地启动与检查
@@ -94,26 +101,91 @@ python -u app.py
 ```powershell
 Invoke-RestMethod "http://127.0.0.1:18001/healthz" | ConvertTo-Json -Depth 10
 Invoke-RestMethod "http://127.0.0.1:18001/readyz" | ConvertTo-Json -Depth 10
+Invoke-RestMethod "http://127.0.0.1:18002/healthz" | ConvertTo-Json -Depth 10
 Invoke-RestMethod "http://127.0.0.1:18002/readyz" | ConvertTo-Json -Depth 10
 ```
 
-`using_taskflow=true` 表示 wordtag 模型已经成功初始化。模型服务如果开启了 `DESENSITIZE_PRELOAD_UIE_CUSTOM=true`，`/readyz` 会等 UIE 预加载完成后才返回 ready。
+`using_taskflow=true` 表示 wordtag 模型已经成功初始化。模型服务如果开启了 `DESENSITIZE_PRELOAD_UIE_CUSTOM=true`，`/readyz` 会等 UIE 预加载完成后才返回 ready。NVIDIA GPU 模式下，模型服务 `/healthz` 还应看到 `device=nvidia`、`gpu_available=true` 和大于 `0` 的 `gpu_device_count`。
+
+## 多实例部署
+
+API 服务是无状态应用，所有会话延续信息都来自请求中历史 `user` 消息携带的 `mapping`。可以部署多个 API 容器或多台 API 服务器，通过负载均衡访问，不需要 sticky session。
+
+模型服务也可以部署多个实例。默认情况下，模型缺失时仍允许自动下载，但下载结果保留在各容器自己的 PaddleNLP 缓存中，不同步写回 `/app/resources/models/*`。如果需要让多个模型容器共享模型文件，建议提前准备模型目录并以只读方式挂载。
 
 ## Docker 部署
 
 镜像拆成两个 target：
 
 - `model`：模型服务镜像，安装 Paddle/PaddleNLP，负责加载 wordtag 和 UIE 模型。
+- `model-nvidia`：NVIDIA CUDA 11.8 模型服务镜像，安装 `paddlepaddle-gpu`，启动时要求可见 NVIDIA GPU。
 - `api`：API 服务镜像，只安装 Flask 等轻量依赖，负责请求校验、映射复用和占位符替换。
 
 构建镜像：
 
 ```powershell
 docker build --target model -t llm-messages-encryptor-model:latest .
+docker build --target model-nvidia -t llm-messages-encryptor-model-nvidia:latest .
 docker build --target api -t llm-messages-encryptor-api:latest .
 ```
 
 正式交付建议使用明确版本号替代 `latest`，例如 `llm-messages-encryptor-api:v0.1.0`。
+
+### NVIDIA GPU 模型服务
+
+首版 GPU 方案只支持 NVIDIA/CUDA，不引入昇腾、寒武纪、AMD、XPU/NPU 等厂商抽象。CPU 模型服务继续使用 `model` target，NVIDIA 模型服务使用 `model-nvidia` target；API 镜像和 API 启动参数不变。
+
+宿主机需要提前安装：
+
+- NVIDIA 驱动。
+- NVIDIA Container Toolkit。
+
+GPU 模式采用严格启动：`DESENSITIZE_DEVICE=nvidia` 时，如果容器内 Paddle 不是 CUDA 版本、没有可见 GPU，或 `DESENSITIZE_DEVICE_ID` 超出可见 GPU 编号范围，模型服务会直接启动失败，不会静默降级到 CPU。
+
+使用所有可见 GPU 启动模型服务：
+
+```powershell
+docker run -d `
+  --gpus all `
+  --restart unless-stopped `
+  -p 18002:18002 `
+  -e MODEL_HOST=0.0.0.0 `
+  -e MODEL_PORT=18002 `
+  -e DESENSITIZE_DEVICE_ID=0 `
+  -v /data/models/wordtag:/app/resources/models/wordtag:ro `
+  -v /data/models/uie-base:/app/resources/models/uie-base:ro `
+  --name llm-messages-encryptor-model `
+  llm-messages-encryptor-model-nvidia:latest
+```
+
+只把第 `0` 张卡授权给容器：
+
+```powershell
+docker run -d `
+  --gpus '"device=0"' `
+  --restart unless-stopped `
+  -p 18002:18002 `
+  -e MODEL_HOST=0.0.0.0 `
+  -e MODEL_PORT=18002 `
+  -e DESENSITIZE_DEVICE_ID=0 `
+  -v /data/models/wordtag:/app/resources/models/wordtag:ro `
+  -v /data/models/uie-base:/app/resources/models/uie-base:ro `
+  --name llm-messages-encryptor-model-gpu0 `
+  llm-messages-encryptor-model-nvidia:latest
+```
+
+启动后检查：
+
+```powershell
+Invoke-RestMethod "http://127.0.0.1:18002/healthz" | ConvertTo-Json -Depth 10
+```
+
+重点字段：
+
+- `device` 应为 `nvidia`。
+- `taskflow_device_id` 应等于 `DESENSITIZE_DEVICE_ID`。
+- `gpu_available` 应为 `true`。
+- `gpu_device_count` 应大于 `0`。
 
 ### 同一台 Docker 主机
 
@@ -248,9 +320,9 @@ docker run -d \
 
 - `wordtag` 模型目录挂载到 `/app/resources/models/wordtag`。
 - `uie-base` 模型目录挂载到 `/app/resources/models/uie-base`。
-- 模型文件只需要放在模型服务机器或模型服务容器的 volume 中。
+- 模型文件只需要放在模型服务机器或模型服务容器的 volume 中；多容器共享时建议只读挂载。
 - API 服务机器不需要模型文件，也不需要安装 PaddlePaddle/PaddleNLP。
-- Linux 宿主机目录挂载时，请确保容器用户 `10001:10001` 对挂载目录有读写权限，或至少对已有模型文件有读取权限。
+- Linux 宿主机目录挂载时，如果只使用预置模型，容器用户 `10001:10001` 只需要读取权限；只有显式开启同步写回时才需要写权限。
 
 ## 示例请求
 
@@ -289,7 +361,7 @@ python -m unittest discover -s tests
 - `app.py`：API 服务入口。
 - `model_app.py`：独立模型服务入口。
 - `desensitize/*.py`：脱敏、识别、远程调用、映射和配置代码。
-- `requirements-api.txt`、`requirements-model.txt`：依赖入口，分别用于 API 服务和模型服务。
+- `requirements-api.txt`、`requirements-model.txt`、`requirements-model-nvidia.txt`：依赖入口，分别用于 API 服务、CPU 模型服务和 NVIDIA GPU 模型服务。
 - `Dockerfile`、`.dockerignore`、`.gitignore`：容器构建和本地文件排除规则。
 - `example_preprocess_request.json`：综合联调示例。
 - `tests/test_service.py`：服务行为回归测试。

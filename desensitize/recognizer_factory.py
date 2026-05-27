@@ -13,6 +13,7 @@ def build_model_recognizer(config: ServiceConfig) -> Any:
 
     return LocalEntityRecognizer(
         model_path=config.model_path,
+        device=config.device,
         device_id=config.device_id,
         enable_taskflow=config.enable_taskflow,
         strict_local_model=config.strict_local_model,
