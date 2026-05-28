@@ -1,7 +1,7 @@
 .git
 .gitignore
 .dockerignore
-Dockerfile
+Dockerfile*
 
 __pycache__/
 *.py[cod]
@@ -31,3 +31,4 @@ resources/models/uie-base/*
 !resources/models/uie-base/README.md
 
 run_and_test.ps1
+tools/

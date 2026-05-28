@@ -40,16 +40,10 @@ python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 ```
 
-安装模型服务依赖：
+安装模型服务依赖。模型推理默认部署在 NVIDIA/CUDA 11.7 服务器上，模型依赖统一使用 `requirements-model.txt`：
 
 ```powershell
-python -m pip install -r requirements-model.txt
-```
-
-NVIDIA GPU 模型服务使用单独依赖入口，首版锁定 CUDA 11.8 路线：
-
-```powershell
-python -m pip install -r requirements-model-nvidia.txt -i https://mirror.baidu.com/pypi/simple
+python -m pip install -r requirements-model.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 ```
 
 如果只启动 API 服务并连接远程模型服务，可以只安装轻量依赖：
@@ -115,25 +109,27 @@ API 服务是无状态应用，所有会话延续信息都来自请求中历史 
 
 ## Docker 部署
 
-镜像拆成两个 target：
+镜像拆成两个专用 Dockerfile：
 
-- `model`：模型服务镜像，安装 Paddle/PaddleNLP，负责加载 wordtag 和 UIE 模型。
-- `model-nvidia`：NVIDIA CUDA 11.8 模型服务镜像，安装 `paddlepaddle-gpu`，启动时要求可见 NVIDIA GPU。
-- `api`：API 服务镜像，只安装 Flask 等轻量依赖，负责请求校验、映射复用和占位符替换。
+- `Dockerfile.model-nvidia`：NVIDIA CUDA 11.7 模型服务镜像，安装 Paddle/PaddleNLP，启动时要求可见 NVIDIA GPU。
+- `Dockerfile.api`：API 服务镜像，只安装 Flask 等 API 依赖，负责请求校验、映射复用和占位符替换。
 
 构建镜像：
 
-```powershell
-docker build --target model -t llm-messages-encryptor-model:latest .
-docker build --target model-nvidia -t llm-messages-encryptor-model-nvidia:latest .
-docker build --target api -t llm-messages-encryptor-api:latest .
+```bash
+sudo docker build -f Dockerfile.model-nvidia -t llm-messages-encryptor-model-nvidia:latest .
+sudo docker build -f Dockerfile.api -t llm-messages-encryptor-api:latest .
 ```
 
 正式交付建议使用明确版本号替代 `latest`，例如 `llm-messages-encryptor-api:v0.1.0`。
 
+两个镜像互不依赖构建阶段；构建 API 镜像时不会安装 Paddle/PaddleNLP，构建 GPU 模型镜像时也不会经过 API 构建逻辑。
+
 ### NVIDIA GPU 模型服务
 
-首版 GPU 方案只支持 NVIDIA/CUDA，不引入昇腾、寒武纪、AMD、XPU/NPU 等厂商抽象。CPU 模型服务继续使用 `model` target，NVIDIA 模型服务使用 `model-nvidia` target；API 镜像和 API 启动参数不变。
+首版 GPU 方案只支持 NVIDIA/CUDA，不引入昇腾、寒武纪、AMD、XPU/NPU 等厂商抽象。NVIDIA 模型服务使用 `Dockerfile.model-nvidia`；API 镜像和 API 启动参数不变。
+
+受限服务器如果只部署模型推理服务，只需要构建并启动 `llm-messages-encryptor-model-nvidia` 镜像；API 服务不参与构建和启动。
 
 宿主机需要提前安装：
 
@@ -195,50 +191,22 @@ Invoke-RestMethod "http://127.0.0.1:18002/healthz" | ConvertTo-Json -Depth 10
 http://llm-messages-encryptor-model:18002
 ```
 
-PowerShell：
-
-```powershell
-docker network create llm_messages_encryptor_net
-docker volume create llm_messages_encryptor_model
-docker volume create llm_messages_encryptor_uie_model
-
-docker run -d `
-  --restart unless-stopped `
-  --network llm_messages_encryptor_net `
-  -e MODEL_HOST=0.0.0.0 `
-  -e MODEL_PORT=18002 `
-  -v llm_messages_encryptor_model:/app/resources/models/wordtag `
-  -v llm_messages_encryptor_uie_model:/app/resources/models/uie-base `
-  --name llm-messages-encryptor-model `
-  llm-messages-encryptor-model:latest
-
-docker run -d `
-  --restart unless-stopped `
-  --network llm_messages_encryptor_net `
-  -p 18001:18001 `
-  -e DESENSITIZE_MODEL_SERVICE_URL=http://llm-messages-encryptor-model:18002 `
-  --name llm-messages-encryptor-api `
-  llm-messages-encryptor-api:latest
-```
-
 Bash：
 
 ```bash
-docker network create llm_messages_encryptor_net
-docker volume create llm_messages_encryptor_model
-docker volume create llm_messages_encryptor_uie_model
+sudo docker network create llm_messages_encryptor_net || true
 
-docker run -d \
+sudo docker run -d \
+  --gpus all \
   --restart unless-stopped \
   --network llm_messages_encryptor_net \
-  -e MODEL_HOST=0.0.0.0 \
-  -e MODEL_PORT=18002 \
-  -v llm_messages_encryptor_model:/app/resources/models/wordtag \
-  -v llm_messages_encryptor_uie_model:/app/resources/models/uie-base \
+  -p 18002:18002 \
+  -v /data/models/wordtag:/app/resources/models/wordtag \
+  -v /data/models/uie-base:/app/resources/models/uie-base \
   --name llm-messages-encryptor-model \
-  llm-messages-encryptor-model:latest
+  llm-messages-encryptor-model-nvidia:latest
 
-docker run -d \
+sudo docker run -d \
   --restart unless-stopped \
   --network llm_messages_encryptor_net \
   -p 18001:18001 \
@@ -261,21 +229,20 @@ API 服务主机：10.10.1.30
 模型服务主机：
 
 ```bash
-docker run -d \
+sudo docker run -d \
+  --gpus all \
   --restart unless-stopped \
   -p 18002:18002 \
-  -e MODEL_HOST=0.0.0.0 \
-  -e MODEL_PORT=18002 \
   -v /data/models/wordtag:/app/resources/models/wordtag \
   -v /data/models/uie-base:/app/resources/models/uie-base \
   --name llm-messages-encryptor-model \
-  llm-messages-encryptor-model:latest
+  llm-messages-encryptor-model-nvidia:latest
 ```
 
 API 服务主机：
 
 ```bash
-docker run -d \
+sudo docker run -d \
   --restart unless-stopped \
   -p 18001:18001 \
   -e DESENSITIZE_MODEL_SERVICE_URL=http://10.10.1.20:18002 \
@@ -290,30 +257,29 @@ docker run -d \
 导出镜像包：
 
 ```powershell
-docker save -o llm-messages-encryptor-model.tar llm-messages-encryptor-model:latest
+docker save -o llm-messages-encryptor-model-nvidia.tar llm-messages-encryptor-model-nvidia:latest
 docker save -o llm-messages-encryptor-api.tar llm-messages-encryptor-api:latest
 ```
 
 业务方服务器导入镜像：
 
 ```powershell
-docker load -i llm-messages-encryptor-model.tar
+docker load -i llm-messages-encryptor-model-nvidia.tar
 docker load -i llm-messages-encryptor-api.tar
 ```
 
 离线环境建议提前准备模型目录，并关闭自动下载：
 
 ```bash
-docker run -d \
+sudo docker run -d \
+  --gpus all \
   --restart unless-stopped \
-  -e MODEL_HOST=0.0.0.0 \
-  -e MODEL_PORT=18002 \
   -e DESENSITIZE_AUTO_DOWNLOAD_MODEL=false \
   -e DESENSITIZE_SYNC_DOWNLOADED_MODEL=false \
   -v /data/models/wordtag:/app/resources/models/wordtag \
   -v /data/models/uie-base:/app/resources/models/uie-base \
   --name llm-messages-encryptor-model \
-  llm-messages-encryptor-model:latest
+  llm-messages-encryptor-model-nvidia:latest
 ```
 
 模型目录要求：
@@ -354,15 +320,15 @@ python -m unittest discover -s tests
 
 ## 仓库瘦身规则
 
-仓库只保留源码、依赖声明、Dockerfile、测试、示例请求和模型目录说明文件。实际模型权重、推理文件和缓存不要提交到 Git。
+仓库只保留源码、依赖声明、专用 Dockerfile、单元测试、示例请求和模型目录说明文件。实际模型权重、推理文件、缓存和本地压测脚本不要提交到 Git。
 
 应保留的交付文件：
 
 - `app.py`：API 服务入口。
 - `model_app.py`：独立模型服务入口。
 - `desensitize/*.py`：脱敏、识别、远程调用、映射和配置代码。
-- `requirements-api.txt`、`requirements-model.txt`、`requirements-model-nvidia.txt`：依赖入口，分别用于 API 服务、CPU 模型服务和 NVIDIA GPU 模型服务。
-- `Dockerfile`、`.dockerignore`、`.gitignore`：容器构建和本地文件排除规则。
+- `requirements-api.txt`、`requirements-model.txt`：依赖入口，分别用于 API 服务和 CUDA 11.7 GPU 模型服务。
+- `Dockerfile.api`、`Dockerfile.model-nvidia`、`.dockerignore`、`.gitignore`：容器构建和本地文件排除规则。
 - `example_preprocess_request.json`：综合联调示例。
 - `tests/test_service.py`：服务行为回归测试。
 - `resources/models/wordtag/README.md`、`resources/models/uie-base/README.md`：模型目录占位说明。
@@ -374,4 +340,4 @@ python -m unittest discover -s tests
 - `logs/`、`*.log`、`run_service.*.log`。
 - `.env`、`.env.*`、个人 IDE 配置。
 - `resources/models/wordtag/*` 和 `resources/models/uie-base/*` 下的实际模型文件。
-- `run_and_test.ps1` 这类本地临时联调脚本。
+- `run_and_test.ps1`、`tools/concurrency_test.py` 这类本地临时联调或压测脚本。

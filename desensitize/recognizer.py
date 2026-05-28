@@ -82,6 +82,7 @@ class LocalEntityRecognizer:
         )
         self._uie_taskflow = None
         self._uie_schema: tuple[str, ...] = ()
+        self._taskflow_lock = threading.RLock()
         self._uie_lock = threading.RLock()
 
         self._taskflow = self._build_taskflow()
@@ -783,8 +784,10 @@ class LocalEntityRecognizer:
         if self._taskflow is None:
             return []
 
+        lock = getattr(self, "_taskflow_lock", nullcontext())
         try:
-            tagged = self._taskflow(text)
+            with lock:
+                tagged = self._taskflow(text)
         except Exception as exc:
             if self.strict_local_model:
                 raise RuntimeError("Taskflow wordtag inference failed.") from exc

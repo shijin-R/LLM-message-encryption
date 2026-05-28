@@ -1,5 +1,8 @@
 -r requirements-api.txt
-paddlepaddle==2.6.2
+
+# Model service dependencies for NVIDIA/CUDA 11.7 deployment.
+# Paddle 2.6 官方 Linux pip 文档将 CUDA 11.7 路线对应到 paddlepaddle-gpu==2.6.1.post117。
+paddlepaddle-gpu==2.6.1.post117
 paddlenlp==2.8.1
 aistudio-sdk==0.2.6
 # PaddleNLP 声明了该依赖，但上游只发布 Linux wheel；Windows 本地开发环境跳过。

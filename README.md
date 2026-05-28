@@ -17,7 +17,7 @@
 ```
 
 - API 服务：应用层，负责请求校验、长文本分片、手机号正则补漏、`custom_entities` 解析、历史 `mapping` 复用、冲突消解和占位符替换，默认通过 HTTP 调用模型服务，只需要 `requirements-api.txt`。
-- 模型服务：纯推理层，常驻加载 wordtag 和 `uie-base`，只接收 `text` 与推理 `tasks`，返回模型原始标签片段，可被多个 API 服务共享；CPU 依赖使用 `requirements-model.txt`，NVIDIA GPU 依赖使用 `requirements-model-nvidia.txt`。
+- 模型服务：纯推理层，常驻加载 wordtag 和 `uie-base`，只接收 `text` 与推理 `tasks`，返回模型原始标签片段，可被多个 API 服务共享；依赖统一使用 `requirements-model.txt`，默认面向 NVIDIA/CUDA 11.7 服务器部署。
 - API 服务不保存会话状态，可部署多个容器或多台服务器并通过负载均衡访问，不需要 sticky session。
 - 模型服务可部署多个实例；默认自动下载到各容器私有缓存，不把下载结果写回共享模型目录，避免多容器抢写。
 
@@ -32,8 +32,7 @@
 
 - 推荐 Python 3.10。
 - `requirements-api.txt`：API 服务轻量依赖。
-- `requirements-model.txt`：模型服务完整依赖，包含 API 依赖、PaddlePaddle 和 PaddleNLP。
-- `requirements-model-nvidia.txt`：NVIDIA/CUDA 11.8 模型服务依赖，使用 `paddlepaddle-gpu==2.6.1`。
+- `requirements-model.txt`：模型服务完整依赖，包含 API 依赖、PaddlePaddle GPU 和 PaddleNLP，默认使用 NVIDIA/CUDA 11.7 路线。
 - wordtag 默认目录：`resources/models/wordtag`。
 - UIE 默认目录：`resources/models/uie-base`。
 
@@ -76,67 +75,49 @@ Invoke-RestMethod "http://127.0.0.1:18002/readyz" | ConvertTo-Json -Depth 10
 
 ## Docker 快速部署
 
-构建两个镜像：
+构建 API 和 GPU 模型两个镜像：
 
-```powershell
-docker build --target model -t llm-messages-encryptor-model:latest .
-docker build --target api -t llm-messages-encryptor-api:latest .
+```bash
+sudo docker build -f Dockerfile.model-nvidia -t llm-messages-encryptor-model-nvidia:latest .
+sudo docker build -f Dockerfile.api -t llm-messages-encryptor-api:latest .
 ```
 
-如果模型服务要使用 NVIDIA GPU，构建 GPU target，API 镜像不变：
+`Dockerfile.model-nvidia` 安装 Paddle/PaddleNLP 和 CUDA 11.7 GPU 依赖；`Dockerfile.api` 只安装 Flask 等 API 依赖，不安装 Paddle/PaddleNLP。
 
-```powershell
-docker build --target model-nvidia -t llm-messages-encryptor-model-nvidia:latest .
-```
+同一台 Docker 主机部署时，两个容器加入同一个 Docker network，API 服务通过模型容器名访问模型服务：
 
-同一台 Docker 主机部署时，两个容器加入同一个 Docker network，API 服务可通过模型容器名访问模型服务：
+```bash
+sudo docker network create llm_messages_encryptor_net || true
 
-```powershell
-docker network create llm_messages_encryptor_net
-docker volume create llm_messages_encryptor_model
-docker volume create llm_messages_encryptor_uie_model
+sudo docker run -d \
+  --gpus all \
+  --restart unless-stopped \
+  --network llm_messages_encryptor_net \
+  -p 18002:18002 \
+  -v /data/models/wordtag:/app/resources/models/wordtag \
+  -v /data/models/uie-base:/app/resources/models/uie-base \
+  --name llm-messages-encryptor-model \
+  llm-messages-encryptor-model-nvidia:latest
 
-docker run -d `
-  --restart unless-stopped `
-  --network llm_messages_encryptor_net `
-  -e MODEL_HOST=0.0.0.0 `
-  -e MODEL_PORT=18002 `
-  -v llm_messages_encryptor_model:/app/resources/models/wordtag `
-  -v llm_messages_encryptor_uie_model:/app/resources/models/uie-base `
-  --name llm-messages-encryptor-model `
-  llm-messages-encryptor-model:latest
-
-docker run -d `
-  --restart unless-stopped `
-  --network llm_messages_encryptor_net `
-  -p 18001:18001 `
-  -e DESENSITIZE_MODEL_SERVICE_URL=http://llm-messages-encryptor-model:18002 `
-  --name llm-messages-encryptor-api `
+sudo docker run -d \
+  --restart unless-stopped \
+  --network llm_messages_encryptor_net \
+  -p 18001:18001 \
+  -e DESENSITIZE_MODEL_SERVICE_URL=http://llm-messages-encryptor-model:18002 \
+  --name llm-messages-encryptor-api \
   llm-messages-encryptor-api:latest
 ```
 
-NVIDIA GPU 模型容器需要宿主机安装 NVIDIA 驱动和 NVIDIA Container Toolkit，并在启动时显式授权 GPU：
+业务系统只需要调用 API 服务：
 
-```powershell
-docker run -d `
-  --gpus all `
-  --restart unless-stopped `
-  --network llm_messages_encryptor_net `
-  -e MODEL_HOST=0.0.0.0 `
-  -e MODEL_PORT=18002 `
-  -e DESENSITIZE_DEVICE_ID=0 `
-  --name llm-messages-encryptor-model `
-  llm-messages-encryptor-model-nvidia:latest
+```text
+POST http://API服务IP:18001/v1/llm/preprocess
+```
 
-docker run -d `
-  --gpus '"device=0"' `
-  --restart unless-stopped `
-  --network llm_messages_encryptor_net `
-  -e MODEL_HOST=0.0.0.0 `
-  -e MODEL_PORT=18002 `
-  -e DESENSITIZE_DEVICE_ID=0 `
-  --name llm-messages-encryptor-model-gpu0 `
-  llm-messages-encryptor-model-nvidia:latest
+如果只把第 `0` 张卡授权给模型容器，把 `--gpus all` 替换为：
+
+```text
+--gpus '"device=0"' -e DESENSITIZE_DEVICE_ID=0
 ```
 
 跨主机部署时，普通 Docker network 不能跨主机使用容器名，API 服务应配置模型服务机器的内网 IP 或内网 DNS：

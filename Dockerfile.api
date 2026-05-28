@@ -1,0 +1,46 @@
+FROM nvcr.io/nvidia/cuda:11.7.0-cudnn8-devel-ubuntu22.04
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONUTF8=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    HOME=/app \
+    HOST=0.0.0.0 \
+    PORT=18001 \
+    DESENSITIZE_MODEL_SERVICE_URL=http://llm-messages-encryptor-model:18002 \
+    HEALTHCHECK_PATH=/readyz
+
+WORKDIR /app
+
+ARG APP_UID=10001
+ARG APP_GID=10001
+
+RUN sed -i 's#http://archive.ubuntu.com/ubuntu#http://mirrors.tuna.tsinghua.edu.cn/ubuntu#g; s#http://security.ubuntu.com/ubuntu#http://mirrors.tuna.tsinghua.edu.cn/ubuntu#g' /etc/apt/sources.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates python3.10 python3-pip \
+    && ln -sf /usr/bin/python3.10 /usr/local/bin/python \
+    && groupadd --gid "${APP_GID}" app \
+    && useradd --uid "${APP_UID}" --gid "${APP_GID}" --home-dir /app --shell /usr/sbin/nologin --no-create-home app \
+    && chown -R app:app /app \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements-api.txt ./
+RUN python -m pip install --upgrade pip setuptools wheel \
+    -i https://pypi.tuna.tsinghua.edu.cn/simple \
+    && python -m pip install -r requirements-api.txt \
+    -i https://pypi.tuna.tsinghua.edu.cn/simple
+
+COPY --chown=app:app app.py .
+COPY --chown=app:app desensitize ./desensitize
+COPY --chown=app:app example_preprocess_request.json .
+COPY --chown=app:app README.md .
+
+EXPOSE 18001
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+    CMD python -c "import json, os, urllib.request; port=os.getenv('PORT', '18001'); path=os.getenv('HEALTHCHECK_PATH', '/readyz'); resp=urllib.request.urlopen(f'http://127.0.0.1:{port}{path}', timeout=3); raise SystemExit(0 if json.load(resp).get('status') in {'ok', 'ready'} else 1)"
+
+USER app
+
+CMD ["python", "app.py"]

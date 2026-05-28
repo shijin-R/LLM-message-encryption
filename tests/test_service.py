@@ -71,6 +71,26 @@ class FakeUIETaskflow:
         return [result]
 
 
+class SlowWordtagTaskflow:
+    def __init__(self) -> None:
+        self.active_calls = 0
+        self.max_active_calls = 0
+        self._calls_lock = threading.Lock()
+
+    def __call__(self, text: str) -> list[tuple[str, str]]:
+        with self._calls_lock:
+            self.active_calls += 1
+            self.max_active_calls = max(self.max_active_calls, self.active_calls)
+        try:
+            time.sleep(0.02)
+            if "李四" in text:
+                return [("李四", "人名")]
+            return [("张三", "人名")]
+        finally:
+            with self._calls_lock:
+                self.active_calls -= 1
+
+
 class SlowSchemaAwareUIETaskflow:
     def __init__(self, output_by_label: dict[str, list[dict]]) -> None:
         self.output_by_label = output_by_label
@@ -581,6 +601,30 @@ class DesensitizeServiceTest(unittest.TestCase):
             [("人名", "张三", "wordtag")],
         )
         self.assertFalse(any(span.text == "13800138000" for span in spans))
+
+    def test_model_infer_wordtag_serializes_taskflow_calls(self) -> None:
+        fake_wordtag = SlowWordtagTaskflow()
+        recognizer = LocalEntityRecognizer.__new__(LocalEntityRecognizer)
+        recognizer._taskflow = fake_wordtag
+        recognizer._taskflow_lock = threading.RLock()
+        recognizer.strict_local_model = True
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            zhang_future = executor.submit(recognizer.infer_wordtag, "联系人张三。")
+            li_future = executor.submit(recognizer.infer_wordtag, "联系人李四。")
+
+        zhang_spans = zhang_future.result()
+        li_spans = li_future.result()
+
+        self.assertEqual(
+            [(span.label, span.text) for span in zhang_spans],
+            [("人名", "张三")],
+        )
+        self.assertEqual(
+            [(span.label, span.text) for span in li_spans],
+            [("人名", "李四")],
+        )
+        self.assertEqual(fake_wordtag.max_active_calls, 1)
 
     def test_model_infer_uie_accepts_schema_without_business_entity_type(self) -> None:
         fake_uie = FakeUIETaskflow(

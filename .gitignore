@@ -35,3 +35,6 @@ resources/models/uie-base/*
 
 # Local demo / smoke-test script, not required in the maintained repo.
 run_and_test.ps1
+
+# Local load-test scripts for environment validation.
+tools/concurrency_test.py
