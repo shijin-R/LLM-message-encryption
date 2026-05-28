@@ -1,4 +1,4 @@
-FROM nvcr.io/nvidia/cuda:11.7.0-cudnn8-runtime-ubuntu22.04
+FROM swr.cn-east-3.myhuaweicloud.com/weaver-qianliling/deploy:cuda11.7.1py3.10
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
