@@ -63,7 +63,7 @@ python -m pip install -r requirements-api.txt
 | `DESENSITIZE_MODEL_PATH` | `resources/models/wordtag` | wordtag 本地模型目录 |
 | `DESENSITIZE_UIE_MODEL_PATH` | `resources/models/uie-base` | UIE 本地模型目录 |
 | `DESENSITIZE_ENABLE_UIE_CUSTOM` | `true` | 是否启用 UIE 信息抽取旁路识别业务自定义实体 |
-| `DESENSITIZE_PRELOAD_UIE_CUSTOM` | `true` | 模型服务启动时是否预加载 UIE |
+| `DESENSITIZE_PRELOAD_UIE_CUSTOM` | `false` | 模型服务启动时是否预加载 UIE；容器默认关闭，避免启动阶段资源冲高 |
 | `DESENSITIZE_UIE_WARMUP_SCHEMA` | `身份证号,卡号,银行卡号,地址,住址` | UIE 预热 schema，逗号分隔 |
 | `DESENSITIZE_AUTO_DOWNLOAD_MODEL` | `true` | 本地模型缺失时是否尝试自动下载 |
 | `DESENSITIZE_SYNC_DOWNLOADED_MODEL` | `false` | 自动下载后是否同步回本地模型目录；生产多容器默认使用各容器私有缓存 |
@@ -109,27 +109,26 @@ API 服务是无状态应用，所有会话延续信息都来自请求中历史 
 
 ## Docker 部署
 
-镜像拆成两个专用 Dockerfile：
+交付镜像统一使用根目录 `Dockerfile`。同一个镜像包含 API 服务和模型服务所需依赖，运行时通过 `SERVICE_ROLE` 区分进程角色：
 
-- `Dockerfile.model-nvidia`：NVIDIA CUDA 11.7 模型服务镜像，安装 Paddle/PaddleNLP，启动时要求可见 NVIDIA GPU。
-- `Dockerfile.api`：API 服务镜像，只安装 Flask 等 API 依赖，负责请求校验、映射复用和占位符替换。
+- `SERVICE_ROLE=model`：启动 `model_app.py`，加载 Paddle/PaddleNLP 和本地模型，对 API 容器暴露纯推理接口。
+- `SERVICE_ROLE=api`：启动 `app.py`，负责请求校验、映射复用和占位符替换，通过 HTTP 调用模型容器。
 
 构建镜像：
 
 ```bash
-sudo docker build -f Dockerfile.model-nvidia -t llm-messages-encryptor-model-nvidia:latest .
-sudo docker build -f Dockerfile.api -t llm-messages-encryptor-api:latest .
+sudo docker build -t llm-messages-encryptor:latest .
 ```
 
-正式交付建议使用明确版本号替代 `latest`，例如 `llm-messages-encryptor-api:v0.1.0`。
+正式交付建议使用明确版本号替代 `latest`，例如 `llm-messages-encryptor:v0.1.0`。
 
-两个镜像互不依赖构建阶段；构建 API 镜像时不会安装 Paddle/PaddleNLP，构建 GPU 模型镜像时也不会经过 API 构建逻辑。
+API 角色容器和模型角色容器可以来自同一个镜像，但模型目录只需要挂载到 `SERVICE_ROLE=model` 的容器。
 
 ### NVIDIA GPU 模型服务
 
-首版 GPU 方案只支持 NVIDIA/CUDA，不引入昇腾、寒武纪、AMD、XPU/NPU 等厂商抽象。NVIDIA 模型服务使用 `Dockerfile.model-nvidia`；API 镜像和 API 启动参数不变。
+首版 GPU 方案只支持 NVIDIA/CUDA，不引入昇腾、寒武纪、AMD、XPU/NPU 等厂商抽象。模型角色默认关闭启动阶段 UIE 预热，避免容器启动时同时加载 wordtag 和 UIE 导致服务器资源打满。
 
-受限服务器如果只部署模型推理服务，只需要构建并启动 `llm-messages-encryptor-model-nvidia` 镜像；API 服务不参与构建和启动。
+你的服务器是 NVIDIA GeForce RTX 2080 Ti，当前 `memory.free` 约 `8872 MiB`。模型容器启动时必须加资源护栏：限制只使用第 `0` 张 GPU，限制宿主机内存和 CPU，并通过 Paddle 的 `FLAGS_fraction_of_gpu_memory_to_use` 限制显存预分配比例。建议先用 `0.4`，确认稳定后再小幅调整。
 
 宿主机需要提前安装：
 
@@ -138,37 +137,25 @@ sudo docker build -f Dockerfile.api -t llm-messages-encryptor-api:latest .
 
 GPU 模式采用严格启动：`DESENSITIZE_DEVICE=nvidia` 时，如果容器内 Paddle 不是 CUDA 版本、没有可见 GPU，或 `DESENSITIZE_DEVICE_ID` 超出可见 GPU 编号范围，模型服务会直接启动失败，不会静默降级到 CPU。
 
-使用所有可见 GPU 启动模型服务：
-
-```powershell
-docker run -d `
-  --gpus all `
-  --restart unless-stopped `
-  -p 18002:18002 `
-  -e MODEL_HOST=0.0.0.0 `
-  -e MODEL_PORT=18002 `
-  -e DESENSITIZE_DEVICE_ID=0 `
-  -v /data/models/wordtag:/app/resources/models/wordtag:ro `
-  -v /data/models/uie-base:/app/resources/models/uie-base:ro `
-  --name llm-messages-encryptor-model `
-  llm-messages-encryptor-model-nvidia:latest
-```
-
-只把第 `0` 张卡授权给容器：
+启动模型角色容器：
 
 ```powershell
 docker run -d `
   --gpus '"device=0"' `
   --restart unless-stopped `
   -p 18002:18002 `
-  -e MODEL_HOST=0.0.0.0 `
-  -e MODEL_PORT=18002 `
+  --memory 8g `
+  --cpus 4 `
+  -e SERVICE_ROLE=model `
   -e DESENSITIZE_DEVICE_ID=0 `
+  -e FLAGS_fraction_of_gpu_memory_to_use=0.4 `
   -v /data/models/wordtag:/app/resources/models/wordtag:ro `
   -v /data/models/uie-base:/app/resources/models/uie-base:ro `
-  --name llm-messages-encryptor-model-gpu0 `
-  llm-messages-encryptor-model-nvidia:latest
+  --name llm-messages-encryptor-model `
+  llm-messages-encryptor:latest
 ```
+
+不建议使用 `--gpus all`。RTX 2080 Ti 单卡场景下固定 `--gpus '"device=0"'` 更容易控制显存和故障范围。
 
 启动后检查：
 
@@ -197,22 +184,30 @@ Bash：
 sudo docker network create llm_messages_encryptor_net || true
 
 sudo docker run -d \
-  --gpus all \
+  --gpus '"device=0"' \
   --restart unless-stopped \
   --network llm_messages_encryptor_net \
   -p 18002:18002 \
+  --memory 8g \
+  --cpus 4 \
+  -e SERVICE_ROLE=model \
+  -e DESENSITIZE_DEVICE_ID=0 \
+  -e FLAGS_fraction_of_gpu_memory_to_use=0.4 \
   -v /data/models/wordtag:/app/resources/models/wordtag \
   -v /data/models/uie-base:/app/resources/models/uie-base \
   --name llm-messages-encryptor-model \
-  llm-messages-encryptor-model-nvidia:latest
+  llm-messages-encryptor:latest
 
 sudo docker run -d \
   --restart unless-stopped \
   --network llm_messages_encryptor_net \
   -p 18001:18001 \
+  --memory 1g \
+  --cpus 1 \
+  -e SERVICE_ROLE=api \
   -e DESENSITIZE_MODEL_SERVICE_URL=http://llm-messages-encryptor-model:18002 \
   --name llm-messages-encryptor-api \
-  llm-messages-encryptor-api:latest
+  llm-messages-encryptor:latest
 ```
 
 ### 不同主机
@@ -230,13 +225,18 @@ API 服务主机：10.10.1.30
 
 ```bash
 sudo docker run -d \
-  --gpus all \
+  --gpus '"device=0"' \
   --restart unless-stopped \
   -p 18002:18002 \
+  --memory 8g \
+  --cpus 4 \
+  -e SERVICE_ROLE=model \
+  -e DESENSITIZE_DEVICE_ID=0 \
+  -e FLAGS_fraction_of_gpu_memory_to_use=0.4 \
   -v /data/models/wordtag:/app/resources/models/wordtag \
   -v /data/models/uie-base:/app/resources/models/uie-base \
   --name llm-messages-encryptor-model \
-  llm-messages-encryptor-model-nvidia:latest
+  llm-messages-encryptor:latest
 ```
 
 API 服务主机：
@@ -245,9 +245,12 @@ API 服务主机：
 sudo docker run -d \
   --restart unless-stopped \
   -p 18001:18001 \
+  --memory 1g \
+  --cpus 1 \
+  -e SERVICE_ROLE=api \
   -e DESENSITIZE_MODEL_SERVICE_URL=http://10.10.1.20:18002 \
   --name llm-messages-encryptor-api \
-  llm-messages-encryptor-api:latest
+  llm-messages-encryptor:latest
 ```
 
 跨主机部署时，建议用防火墙或安全组限制只有 API 服务主机可以访问模型服务主机的 `18002` 端口。
@@ -257,29 +260,32 @@ sudo docker run -d \
 导出镜像包：
 
 ```powershell
-docker save -o llm-messages-encryptor-model-nvidia.tar llm-messages-encryptor-model-nvidia:latest
-docker save -o llm-messages-encryptor-api.tar llm-messages-encryptor-api:latest
+docker save -o llm-messages-encryptor.tar llm-messages-encryptor:latest
 ```
 
 业务方服务器导入镜像：
 
 ```powershell
-docker load -i llm-messages-encryptor-model-nvidia.tar
-docker load -i llm-messages-encryptor-api.tar
+docker load -i llm-messages-encryptor.tar
 ```
 
 离线环境建议提前准备模型目录，并关闭自动下载：
 
 ```bash
 sudo docker run -d \
-  --gpus all \
+  --gpus '"device=0"' \
   --restart unless-stopped \
+  --memory 8g \
+  --cpus 4 \
+  -e SERVICE_ROLE=model \
+  -e DESENSITIZE_DEVICE_ID=0 \
+  -e FLAGS_fraction_of_gpu_memory_to_use=0.4 \
   -e DESENSITIZE_AUTO_DOWNLOAD_MODEL=false \
   -e DESENSITIZE_SYNC_DOWNLOADED_MODEL=false \
   -v /data/models/wordtag:/app/resources/models/wordtag \
   -v /data/models/uie-base:/app/resources/models/uie-base \
   --name llm-messages-encryptor-model \
-  llm-messages-encryptor-model-nvidia:latest
+  llm-messages-encryptor:latest
 ```
 
 模型目录要求：
@@ -287,7 +293,7 @@ sudo docker run -d \
 - `wordtag` 模型目录挂载到 `/app/resources/models/wordtag`。
 - `uie-base` 模型目录挂载到 `/app/resources/models/uie-base`。
 - 模型文件只需要放在模型服务机器或模型服务容器的 volume 中；多容器共享时建议只读挂载。
-- API 服务机器不需要模型文件，也不需要安装 PaddlePaddle/PaddleNLP。
+- API 角色容器不需要挂载模型目录，也不会在 API 进程里加载 PaddlePaddle/PaddleNLP。
 - Linux 宿主机目录挂载时，如果只使用预置模型，容器用户 `10001:10001` 只需要读取权限；只有显式开启同步写回时才需要写权限。
 
 ## 示例请求
@@ -320,7 +326,7 @@ python -m unittest discover -s tests
 
 ## 仓库瘦身规则
 
-仓库只保留源码、依赖声明、专用 Dockerfile、单元测试、示例请求和模型目录说明文件。实际模型权重、推理文件、缓存和本地压测脚本不要提交到 Git。
+仓库只保留源码、依赖声明、单一交付 Dockerfile、单元测试、示例请求和模型目录说明文件。实际模型权重、推理文件、缓存和本地压测脚本不要提交到 Git。
 
 应保留的交付文件：
 
@@ -328,7 +334,7 @@ python -m unittest discover -s tests
 - `model_app.py`：独立模型服务入口。
 - `desensitize/*.py`：脱敏、识别、远程调用、映射和配置代码。
 - `requirements-api.txt`、`requirements-model.txt`：依赖入口，分别用于 API 服务和 CUDA 11.7 GPU 模型服务。
-- `Dockerfile.api`、`Dockerfile.model-nvidia`、`.dockerignore`、`.gitignore`：容器构建和本地文件排除规则。
+- `Dockerfile`、`.dockerignore`、`.gitignore`：容器构建和本地文件排除规则。
 - `example_preprocess_request.json`：综合联调示例。
 - `tests/test_service.py`：服务行为回归测试。
 - `resources/models/wordtag/README.md`、`resources/models/uie-base/README.md`：模型目录占位说明。

@@ -72,8 +72,8 @@ class ServiceConfig:
     model_service_url: str = "http://127.0.0.1:18002"
     # API 调用模型服务的超时时间。
     model_service_timeout: float = 30.0
-    # 模型服务启动时是否预加载 UIE。
-    preload_uie_custom: bool = True
+    # 模型服务启动时是否预加载 UIE；默认关闭，避免容器启动阶段一次性吃满服务器资源。
+    preload_uie_custom: bool = False
     # UIE 预热 schema；后续请求仍可按业务传入的 uie_schema 动态更新。
     uie_warmup_schema: tuple[str, ...] = (
         "身份证号",
@@ -139,7 +139,7 @@ class ServiceConfig:
             model_service_timeout=float(
                 os.getenv("DESENSITIZE_MODEL_SERVICE_TIMEOUT", "30")
             ),
-            preload_uie_custom=_env_to_bool("DESENSITIZE_PRELOAD_UIE_CUSTOM", True),
+            preload_uie_custom=_env_to_bool("DESENSITIZE_PRELOAD_UIE_CUSTOM", False),
             uie_warmup_schema=_env_to_tuple(
                 "DESENSITIZE_UIE_WARMUP_SCHEMA",
                 (

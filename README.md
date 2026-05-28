@@ -36,7 +36,7 @@
 - wordtag 默认目录：`resources/models/wordtag`。
 - UIE 默认目录：`resources/models/uie-base`。
 
-实际模型权重、缓存和推理文件不进入 Git 仓库。模型文件只需要准备在模型服务侧，API 服务侧不需要安装 PaddlePaddle、PaddleNLP，也不需要挂载模型目录。
+实际模型权重、缓存和推理文件不进入 Git 仓库。模型文件只需要挂载到模型服务容器；API 角色容器虽然来自同一个镜像，但不需要挂载模型目录，也不会在 API 进程里加载 PaddlePaddle/PaddleNLP。
 
 ## 快速启动
 
@@ -75,14 +75,13 @@ Invoke-RestMethod "http://127.0.0.1:18002/readyz" | ConvertTo-Json -Depth 10
 
 ## Docker 快速部署
 
-构建 API 和 GPU 模型两个镜像：
+交付只构建一个镜像，同一镜像通过 `SERVICE_ROLE` 区分 API 服务和模型服务：
 
 ```bash
-sudo docker build -f Dockerfile.model-nvidia -t llm-messages-encryptor-model-nvidia:latest .
-sudo docker build -f Dockerfile.api -t llm-messages-encryptor-api:latest .
+sudo docker build -t llm-messages-encryptor:latest .
 ```
 
-`Dockerfile.model-nvidia` 安装 Paddle/PaddleNLP 和 CUDA 11.7 GPU 依赖；`Dockerfile.api` 只安装 Flask 等 API 依赖，不安装 Paddle/PaddleNLP。
+镜像内包含 API 服务和模型服务所需的全部依赖。模型服务默认使用 NVIDIA/CUDA 11.7，关闭启动阶段 UIE 预热，并限制 Paddle 线程和 GPU 显存预分配，避免容器启动时一次性占满服务器资源。
 
 同一台 Docker 主机部署时，两个容器加入同一个 Docker network，API 服务通过模型容器名访问模型服务：
 
@@ -90,22 +89,30 @@ sudo docker build -f Dockerfile.api -t llm-messages-encryptor-api:latest .
 sudo docker network create llm_messages_encryptor_net || true
 
 sudo docker run -d \
-  --gpus all \
+  --gpus '"device=0"' \
   --restart unless-stopped \
   --network llm_messages_encryptor_net \
   -p 18002:18002 \
+  --memory 8g \
+  --cpus 4 \
+  -e SERVICE_ROLE=model \
+  -e DESENSITIZE_DEVICE_ID=0 \
+  -e FLAGS_fraction_of_gpu_memory_to_use=0.4 \
   -v /data/models/wordtag:/app/resources/models/wordtag \
   -v /data/models/uie-base:/app/resources/models/uie-base \
   --name llm-messages-encryptor-model \
-  llm-messages-encryptor-model-nvidia:latest
+  llm-messages-encryptor:latest
 
 sudo docker run -d \
   --restart unless-stopped \
   --network llm_messages_encryptor_net \
   -p 18001:18001 \
+  --memory 1g \
+  --cpus 1 \
+  -e SERVICE_ROLE=api \
   -e DESENSITIZE_MODEL_SERVICE_URL=http://llm-messages-encryptor-model:18002 \
   --name llm-messages-encryptor-api \
-  llm-messages-encryptor-api:latest
+  llm-messages-encryptor:latest
 ```
 
 业务系统只需要调用 API 服务：
@@ -114,11 +121,13 @@ sudo docker run -d \
 POST http://API服务IP:18001/v1/llm/preprocess
 ```
 
-如果只把第 `0` 张卡授权给模型容器，把 `--gpus all` 替换为：
+如果服务器资源充足，并且希望模型服务启动阶段就加载 UIE，可以额外设置：
 
 ```text
---gpus '"device=0"' -e DESENSITIZE_DEVICE_ID=0
+-e DESENSITIZE_PRELOAD_UIE_CUSTOM=true
 ```
+
+RTX 2080 Ti 当前可用显存约 `8872 MiB` 时，建议先保持 `FLAGS_fraction_of_gpu_memory_to_use=0.4`，并用 `--memory 8g --cpus 4` 给模型容器加护栏；确认稳定后再小幅上调。`--memory` 是宿主机内存上限，GPU 显存主要由 `--gpus '"device=0"'` 和 Paddle 的 `FLAGS_fraction_of_gpu_memory_to_use` 控制。
 
 跨主机部署时，普通 Docker network 不能跨主机使用容器名，API 服务应配置模型服务机器的内网 IP 或内网 DNS：
 
@@ -199,7 +208,7 @@ Invoke-RestMethod `
 
 ## 接入注意事项
 
-- 业务方只调用 API 服务时，不需要安装 PaddlePaddle、PaddleNLP，也不需要下载模型。
+- 业务方只调用 API 服务时，不需要准备或挂载模型目录。
 - 模型下载、模型挂载和 UIE 预加载都由模型服务侧负责。
 - 如果身份证号、银行卡号或地址未脱敏，先检查 `/healthz` 中的 `model_service.enable_uie_custom` 和 `model_service.using_uie`。
 - 服务是无状态的，调用方必须保存 `data.mapping`，并在下一轮历史 `user` 消息中携带该映射和 `encrypted=true`。

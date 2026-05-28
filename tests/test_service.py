@@ -902,6 +902,11 @@ class DesensitizeServiceTest(unittest.TestCase):
 
         self.assertFalse(config.sync_downloaded_model)
 
+    def test_uie_preload_is_disabled_by_default(self) -> None:
+        config = ServiceConfig(model_path=Path("resources/models/wordtag"))
+
+        self.assertFalse(config.preload_uie_custom)
+
     def test_downloaded_model_sync_respects_flag(self) -> None:
         recognizer = LocalEntityRecognizer.__new__(LocalEntityRecognizer)
         recognizer.downloaded_model_cache_path = Path("cache/wordtag")
