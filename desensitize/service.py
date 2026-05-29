@@ -188,6 +188,42 @@ class DesensitizeService:
             )
             replacement_count += 1
 
+        masked_text, replay_count = self._replay_new_mapping_replacements(
+            masked_text,
+            mapping_store,
+        )
+        replacement_count += replay_count
+
+        return masked_text, replacement_count
+
+    def _replay_new_mapping_replacements(
+        self,
+        text: str,
+        mapping_store: MappingStore,
+    ) -> tuple[str, int]:
+        """用本次新建映射补替换同一文本中模型漏掉的重复实体。"""
+        new_mapping = mapping_store.new_items()
+        if not new_mapping:
+            return text, 0
+
+        replay_spans = self._resolve_overlaps(
+            text,
+            self._extract_mapping_spans(text, new_mapping),
+        )
+        if not replay_spans:
+            return text, 0
+
+        masked_text = text
+        replacement_count = 0
+        for span in sorted(replay_spans, key=lambda item: item.start, reverse=True):
+            placeholder = mapping_store.get_or_create(span.entity_type, span.text)
+            if not placeholder:
+                continue
+            masked_text = (
+                masked_text[: span.start] + placeholder + masked_text[span.end :]
+            )
+            replacement_count += 1
+
         return masked_text, replacement_count
 
     def _recognize_text(

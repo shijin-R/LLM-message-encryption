@@ -481,6 +481,59 @@ class DesensitizeServiceTest(unittest.TestCase):
             "手机号[[MOBILE_001]]",
         )
 
+    def test_new_mapping_replaces_repeated_entities_in_same_message(self) -> None:
+        id_card = "110101199003071234"
+        bank_card = "6222020202020202020"
+
+        class FirstOccurrenceRecognizer:
+            def recognize(
+                self,
+                text: str,
+                custom_entities: list[dict],
+            ) -> list[EntitySpan]:
+                spans: list[EntitySpan] = []
+                for entity_type, value in (
+                    ("ID_CARD", id_card),
+                    ("BANK_CARD", bank_card),
+                ):
+                    start = text.find(value)
+                    if start >= 0:
+                        spans.append(
+                            EntitySpan(
+                                entity_type,
+                                value,
+                                start,
+                                start + len(value),
+                                "custom",
+                            )
+                        )
+                return spans
+
+        self.service.recognizer = FirstOccurrenceRecognizer()
+        content = (
+            f"第一处身份证号{id_card}，银行卡号{bank_card}。"
+            f"第二处身份证号{id_card}，银行卡号{bank_card}。"
+        )
+
+        result = self.preprocess(
+            [{"role": "user", "content": content, "encrypted": False}]
+        )
+
+        masked = result["desensitized_request"]["messages"][0]["content"]
+        self.assertNotIn(id_card, masked)
+        self.assertNotIn(bank_card, masked)
+        self.assertEqual(masked.count("[[ID_CARD_001]]"), 2)
+        self.assertEqual(masked.count("[[BANK_CARD_001]]"), 2)
+        self.assertEqual(result["stats"]["replacements"], 4)
+        self.assertEqual(
+            result["mapping"]["ID_CARD"][id_card],
+            "[[ID_CARD_001]]",
+        )
+        self.assertEqual(
+            result["mapping"]["BANK_CARD"][bank_card],
+            "[[BANK_CARD_001]]",
+        )
+
     def test_all_unencrypted_user_content_is_processed(self) -> None:
         result = self.preprocess(
             [
