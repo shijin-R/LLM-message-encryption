@@ -16,7 +16,7 @@
 业务系统 -> API 服务 app.py:18001 -> 模型服务 model_app.py:18002
 ```
 
-- API 服务：应用层，负责请求校验、长文本分片、手机号正则补漏、`custom_entities` 解析、历史 `mapping` 复用、冲突消解和占位符替换，默认通过 HTTP 调用模型服务，只需要 `requirements-api.txt`。
+- API 服务：应用层，负责请求校验、手机号正则补漏、`custom_entities` 解析、历史 `mapping` 复用、冲突消解和占位符替换，默认通过 HTTP 调用模型服务，只需要 `requirements-api.txt`。
 - 模型服务：纯推理层，常驻加载 wordtag 和 `uie-base`，只接收 `text` 与推理 `tasks`，返回模型原始标签片段，可被多个 API 服务共享；依赖统一使用 `requirements-model.txt`，默认面向 NVIDIA/CUDA 11.7 服务器部署。
 - API 服务不保存会话状态，可部署多个容器或多台服务器并通过负载均衡访问，不需要 sticky session。
 - 模型服务可部署多个实例；默认自动下载到各容器私有缓存，不把下载结果写回共享模型目录，避免多容器抢写。
@@ -25,7 +25,7 @@
 
 - 内置实体：API 服务编排 wordtag 模型结果，并在应用层用手机号规则补漏。
 - 自定义实体：API 服务把 `custom_entities[].uie_schema` 转成模型服务的 UIE schema，再把模型标签映射回业务实体类型。
-- 长文本会在 API 服务识别编排前按 `DESENSITIZE_MAX_TEXT_LEN` 分片处理，默认每片 `512` 字符，并保留重叠区避免边界漏识别。
+- 长文本由模型服务内部使用 Taskflow tokenizer 按自然边界合并/切分；wordtag 和 UIE 共用 `512` token 上限并继续批量推理，API 服务不再做字符窗口重叠分片。
 - 除手机号外，不再执行自定义正则、固定值、字符串模式或 `model_labels` 匹配。
 
 ## 依赖与模型

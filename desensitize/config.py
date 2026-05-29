@@ -22,6 +22,14 @@ def _env_to_tuple(name: str, default: tuple[str, ...]) -> tuple[str, ...]:
     return tuple(item.strip() for item in raw.split(",") if item.strip())
 
 
+def _env_to_positive_int(name: str, default: int) -> int:
+    """读取正整数环境变量；token 窗口不能为 0 或负数。"""
+    value = int(os.getenv(name, str(default)))
+    if value <= 0:
+        raise ValueError(f"{name} must be a positive integer. got={value!r}")
+    return value
+
+
 def _env_to_device(name: str, default: str) -> str:
     """读取推理设备类型；首版只支持 CPU 和 NVIDIA CUDA。"""
     device = os.getenv(name, default).strip().lower()
@@ -42,8 +50,6 @@ class ServiceConfig:
     device: str = "cpu"
     # NVIDIA GPU 编号；CPU 模式下会转换为 PaddleNLP 的 -1。
     device_id: int = 0
-    # 单个识别分片允许处理的最大长度。
-    max_text_len: int = 512
     # 是否启用 PaddleNLP Taskflow wordtag 模型识别。
     enable_taskflow: bool = True
     # 严格模式：模型不可用时启动报错；本服务要求必须使用 Taskflow wordtag。
@@ -62,6 +68,10 @@ class ServiceConfig:
     uie_model_path: Path = Path("resources/models/uie-base")
     # UIE span 起止位置概率阈值。
     uie_position_prob: float = 0.5
+    # 模型侧 token 上限；wordtag 和 UIE 都不会超过该预算。
+    max_model_tokens: int = 512
+    # UIE 文本软目标窗口；兼容保留字段，吞吐优先切片不再使用。
+    uie_target_text_tokens: int = 512
     # UIE 严格模式：旁路模型不可用时是否抛错。
     strict_uie_model: bool = False
     # PaddleNLP UIE 默认下载缓存目录。
@@ -120,7 +130,6 @@ class ServiceConfig:
             model_path=model_path,
             device=_env_to_device("DESENSITIZE_DEVICE", "cpu"),
             device_id=int(os.getenv("DESENSITIZE_DEVICE_ID", "0")),
-            max_text_len=int(os.getenv("DESENSITIZE_MAX_TEXT_LEN", "512")),
             enable_taskflow=_env_to_bool("DESENSITIZE_ENABLE_TASKFLOW", True),
             strict_local_model=_env_to_bool("DESENSITIZE_STRICT_LOCAL_MODEL", True),
             auto_download_model=_env_to_bool("DESENSITIZE_AUTO_DOWNLOAD_MODEL", True),
@@ -130,6 +139,11 @@ class ServiceConfig:
             uie_model_name=uie_model_name,
             uie_model_path=uie_model_path,
             uie_position_prob=float(os.getenv("DESENSITIZE_UIE_POSITION_PROB", "0.5")),
+            max_model_tokens=_env_to_positive_int("DESENSITIZE_MAX_MODEL_TOKENS", 512),
+            uie_target_text_tokens=_env_to_positive_int(
+                "DESENSITIZE_UIE_TARGET_TEXT_TOKENS",
+                512,
+            ),
             strict_uie_model=_env_to_bool("DESENSITIZE_STRICT_UIE_MODEL", False),
             downloaded_uie_model_cache_path=downloaded_uie_model_cache_path,
             model_service_url=os.getenv(

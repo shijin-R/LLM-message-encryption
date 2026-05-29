@@ -1,13 +1,13 @@
 """本地模型推理适配器。
 
 只负责加载并调用 PaddleNLP Taskflow wordtag / UIE 模型，返回原始模型标签。
-业务实体类型映射、正则补漏、长文本切分和占位符处理都在应用层完成。
+业务实体类型映射、正则补漏和占位符处理都在应用层完成。
 """
 
 import logging
 import shutil
 import threading
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
@@ -26,6 +26,12 @@ class LocalEntityRecognizer:
     WORDTAG_SOURCE = "wordtag"
     UIE_SOURCE = "uie"
     SUPPORTED_DEVICES = {"cpu", "nvidia"}
+    DEFAULT_MAX_MODEL_TOKENS = 512
+    WORDTAG_SPECIAL_TOKENS = 2
+    UIE_SPECIAL_TOKENS = 4
+    DEFAULT_UIE_TARGET_TEXT_TOKENS = 512
+    UIE_BATCH_SIZE = 8
+    SEMANTIC_BOUNDARY_CHARS = "\r\n。.！？!?；;"
 
     def __init__(
         self,
@@ -41,6 +47,8 @@ class LocalEntityRecognizer:
         uie_model_name: str = "uie-base",
         uie_model_path: Path | None = None,
         uie_position_prob: float = 0.5,
+        max_model_tokens: int = DEFAULT_MAX_MODEL_TOKENS,
+        uie_target_text_tokens: int = DEFAULT_UIE_TARGET_TEXT_TOKENS,
         strict_uie_model: bool = False,
         downloaded_uie_model_cache_path: Path | None = None,
     ) -> None:
@@ -70,6 +78,14 @@ class LocalEntityRecognizer:
             else self.model_path.parent / uie_model_name
         )
         self.uie_position_prob = uie_position_prob
+        self.max_model_tokens = self._normalize_positive_int(
+            max_model_tokens,
+            "max_model_tokens",
+        )
+        self.uie_target_text_tokens = self._normalize_positive_int(
+            uie_target_text_tokens,
+            "uie_target_text_tokens",
+        )
         self.strict_uie_model = strict_uie_model
         self.downloaded_uie_model_cache_path = (
             Path(downloaded_uie_model_cache_path)
@@ -84,6 +100,7 @@ class LocalEntityRecognizer:
         self._uie_schema: tuple[str, ...] = ()
         self._taskflow_lock = threading.RLock()
         self._uie_lock = threading.RLock()
+        self._infer_lock = threading.RLock()
 
         self._taskflow = self._build_taskflow()
 
@@ -137,6 +154,13 @@ class LocalEntityRecognizer:
                 "DESENSITIZE_DEVICE must be one of: cpu, nvidia. "
                 f"got={normalized!r}"
             )
+        return normalized
+
+    @staticmethod
+    def _normalize_positive_int(value: Any, name: str) -> int:
+        normalized = int(value)
+        if normalized <= 0:
+            raise ValueError(f"{name} must be a positive integer. got={normalized!r}")
         return normalized
 
     def _detect_nvidia_status(self) -> dict[str, Any]:
@@ -509,10 +533,15 @@ class LocalEntityRecognizer:
         uie_schema = self._normalize_uie_schema(normalized_tasks.get("uie_schema"))
 
         spans: list[ModelSpan] = []
-        if run_wordtag:
-            spans.extend(self.infer_wordtag(text))
-        if uie_schema:
-            spans.extend(self.infer_uie(text, uie_schema))
+        # PaddleNLP Taskflow/predictor instances are process-local mutable objects.
+        # Serializing the model path avoids intermittent failures when wordtag and UIE
+        # enter the underlying runtime at the same time.
+        lock = getattr(self, "_infer_lock", nullcontext())
+        with lock:
+            if run_wordtag:
+                spans.extend(self.infer_wordtag(text))
+            if uie_schema:
+                spans.extend(self.infer_uie(text, uie_schema))
 
         return self._deduplicate_model_spans(spans, text)
 
@@ -520,7 +549,15 @@ class LocalEntityRecognizer:
         """执行 wordtag 模型推理。"""
         if not text:
             return []
-        return self._deduplicate_model_spans(self._extract_with_taskflow(text), text)
+        if self._taskflow is None:
+            return []
+
+        spans: list[ModelSpan] = []
+        for offset, chunk in self._iter_token_chunks(text, self._taskflow):
+            # 模型在 chunk 内返回局部坐标，进入业务层前统一回填成全文坐标。
+            for span in self._extract_with_taskflow(chunk):
+                spans.append(self._offset_model_span(span, offset))
+        return self._deduplicate_model_spans(spans, text)
 
     def warmup_uie(self, schema: list[str] | tuple[str, ...]) -> bool:
         """按给定 schema 预加载 UIE 模型。"""
@@ -581,15 +618,273 @@ class LocalEntityRecognizer:
             if uie_taskflow is None:
                 return []
 
-            try:
-                tagged = uie_taskflow(text)
-            except Exception as exc:
-                if self.strict_uie_model:
-                    raise RuntimeError("Taskflow UIE inference failed.") from exc
-                logger.warning("Taskflow UIE inference failed, skip UIE extraction: %s", exc)
-                return []
+            spans: list[ModelSpan] = []
+            # UIE 复用吞吐优先的主切片器，再批量送入 Taskflow，减少模型调用开销。
+            chunks = self._iter_uie_token_chunks(text, uie_taskflow, schema)
+            for batch in self._iter_batches(chunks, self.UIE_BATCH_SIZE):
+                try:
+                    tagged_items = self._infer_uie_batch(
+                        uie_taskflow,
+                        [chunk for _, chunk in batch],
+                    )
+                except Exception as exc:
+                    if self.strict_uie_model:
+                        raise RuntimeError("Taskflow UIE inference failed.") from exc
+                    logger.warning("Taskflow UIE inference failed, skip UIE extraction: %s", exc)
+                    return []
 
-        return list(self._iter_uie_spans(text, tagged))
+                for (offset, chunk), tagged in zip(batch, tagged_items):
+                    for span in self._iter_uie_spans(chunk, tagged):
+                        spans.append(self._offset_model_span(span, offset))
+
+        return spans
+
+    def _iter_uie_token_chunks(
+        self,
+        text: str,
+        taskflow: Any,
+        prompts: list[str] | tuple[str, ...],
+    ) -> Iterator[tuple[int, str]]:
+        """UIE 复用主切片器，只额外扣除 schema prompt 的 token 预算。"""
+        yield from self._iter_token_chunks(text, taskflow, prompts=prompts)
+
+    def _iter_token_chunks(
+        self,
+        text: str,
+        taskflow: Any,
+        prompts: list[str] | tuple[str, ...] = (),
+    ) -> Iterator[tuple[int, str]]:
+        """按自然边界聚合文本，并用 Taskflow tokenizer 控制 token 预算。"""
+        if not text:
+            return
+
+        tokenizer = self._taskflow_tokenizer(taskflow)
+        budget = self._available_token_budget(taskflow, tokenizer, prompts)
+        current_start = -1
+        current_text = ""
+        current_tokens = 0
+
+        for unit_start, unit_text in self._iter_semantic_units(text):
+            unit_tokens = self._token_count(unit_text, tokenizer)
+            if unit_tokens > budget:
+                # 单个语义单元已经超预算时，先提交已合并内容，再对该单元做 token window。
+                if current_text:
+                    yield current_start, current_text
+                    current_start = -1
+                    current_text = ""
+                    current_tokens = 0
+                yield from self._split_long_unit_by_tokens(
+                    unit_start,
+                    unit_text,
+                    tokenizer,
+                    budget,
+                )
+                continue
+
+            if not current_text:
+                current_start = unit_start
+                current_text = unit_text
+                current_tokens = unit_tokens
+                continue
+
+            if current_tokens + unit_tokens > budget:
+                # 正常路径只在语义单元之间断开，避免把地址、证件号等实体切成半截。
+                yield current_start, current_text
+                current_start = unit_start
+                current_text = unit_text
+                current_tokens = unit_tokens
+                continue
+
+            current_text += unit_text
+            current_tokens += unit_tokens
+
+        if current_text:
+            yield current_start, current_text
+
+    @staticmethod
+    def _iter_batches(
+        items: Iterable[tuple[int, str]],
+        batch_size: int,
+    ) -> Iterator[list[tuple[int, str]]]:
+        size = max(1, batch_size)
+        batch: list[tuple[int, str]] = []
+        for item in items:
+            batch.append(item)
+            if len(batch) >= size:
+                yield batch
+                batch = []
+        if batch:
+            yield batch
+
+    def _infer_uie_batch(self, uie_taskflow: Any, chunks: list[str]) -> list[Any]:
+        """UIE 小 chunk 保准确率，再用 Taskflow 批量输入减少调用开销。"""
+        if not chunks:
+            return []
+        if len(chunks) == 1:
+            return [uie_taskflow(chunks[0])]
+
+        try:
+            tagged = uie_taskflow(chunks)
+        except Exception:
+            # 个别 Taskflow 版本或测试桩不支持 list 输入时，退回逐条调用，保持兼容。
+            return [uie_taskflow(chunk) for chunk in chunks]
+
+        if isinstance(tagged, list) and len(tagged) == len(chunks):
+            return list(tagged)
+
+        # 返回结构不符合 batch 预期时逐条重跑，避免把整批结果误套到每个 chunk 上。
+        return [uie_taskflow(chunk) for chunk in chunks]
+
+    def _iter_semantic_units(self, text: str) -> Iterator[tuple[int, str]]:
+        """按自然标点拆分语义单元；只做切片，不做实体识别。"""
+        start = 0
+        index = 0
+        while index < len(text):
+            if text[index] not in self.SEMANTIC_BOUNDARY_CHARS:
+                index += 1
+                continue
+
+            # 连续边界符作为同一个语义单元结尾处理，避免 "\r\n" 被拆成孤立换行片段。
+            end = index + 1
+            while end < len(text) and text[end] in self.SEMANTIC_BOUNDARY_CHARS:
+                end += 1
+            if end > start:
+                yield start, text[start:end]
+            start = end
+            index = end
+        if start < len(text):
+            yield start, text[start:]
+
+    def _split_long_unit_by_tokens(
+        self,
+        base_offset: int,
+        text: str,
+        tokenizer: Any,
+        budget: int,
+    ) -> Iterator[tuple[int, str]]:
+        """对超长语义单元做 token window 切分，并避免切在数字/字母中间。"""
+        start = 0
+        while start < len(text):
+            # 没有自然边界可用时，用二分减少 tokenizer 调用次数，找到预算内最长窗口。
+            end = self._max_end_within_token_budget(text, start, tokenizer, budget)
+            if end <= start:
+                end = min(len(text), start + max(1, budget))
+
+            safe_end = self._avoid_ascii_alnum_split(text, start, end)
+            if safe_end > start:
+                end = safe_end
+
+            yield base_offset + start, text[start:end]
+            start = end
+
+    def _max_end_within_token_budget(
+        self,
+        text: str,
+        start: int,
+        tokenizer: Any,
+        budget: int,
+    ) -> int:
+        low = start + 1
+        high = len(text)
+        best = low
+        while low <= high:
+            mid = (low + high) // 2
+            token_count = self._token_count(text[start:mid], tokenizer)
+            if token_count <= budget:
+                best = mid
+                low = mid + 1
+            else:
+                high = mid - 1
+        return best
+
+    @classmethod
+    def _avoid_ascii_alnum_split(cls, text: str, start: int, end: int) -> int:
+        if end <= start or end >= len(text):
+            return end
+        if not (cls._is_ascii_alnum(text[end - 1]) and cls._is_ascii_alnum(text[end])):
+            return end
+
+        # 银行卡、身份证等核心实体都是 ASCII 数字/字母串；能回退就不要从串中间切开。
+        candidate = end
+        while candidate > start and cls._is_ascii_alnum(text[candidate - 1]):
+            candidate -= 1
+        return candidate if candidate > start else end
+
+    def _available_token_budget(
+        self,
+        taskflow: Any,
+        tokenizer: Any,
+        prompts: list[str] | tuple[str, ...],
+    ) -> int:
+        task_instance = getattr(taskflow, "task_instance", taskflow)
+        max_model_tokens = self._max_model_tokens()
+        max_seq_len = int(
+            getattr(task_instance, "_max_seq_len", max_model_tokens)
+            or max_model_tokens
+        )
+        max_seq_len = min(max_seq_len, max_model_tokens)
+
+        if prompts:
+            # UIE 会把 prompt 和文本拼进同一序列，文本预算要扣掉最长 prompt 的 token。
+            prompt_tokens = max(self._token_count(prompt, tokenizer) for prompt in prompts)
+            overhead = prompt_tokens + int(
+                getattr(task_instance, "_summary_token_num", self.UIE_SPECIAL_TOKENS)
+                or self.UIE_SPECIAL_TOKENS
+            )
+        else:
+            # wordtag 没有业务 prompt，只保守扣掉 Taskflow 汇总/特殊 token 开销。
+            overhead = int(
+                getattr(task_instance, "summary_num", self.WORDTAG_SPECIAL_TOKENS - 1)
+                or 0
+            ) + 1
+
+        return max(1, max_seq_len - overhead)
+
+    def _max_model_tokens(self) -> int:
+        return self._normalize_positive_int(
+            getattr(self, "max_model_tokens", self.DEFAULT_MAX_MODEL_TOKENS),
+            "max_model_tokens",
+        )
+
+    @staticmethod
+    def _taskflow_tokenizer(taskflow: Any) -> Any:
+        task_instance = getattr(taskflow, "task_instance", taskflow)
+        return getattr(task_instance, "_tokenizer", None)
+
+    def _token_count(self, text: str, tokenizer: Any) -> int:
+        if not text:
+            return 0
+        if tokenizer is not None:
+            for kwargs in (
+                {"text": text, "add_special_tokens": False},
+                {"text": text},
+            ):
+                try:
+                    encoded = tokenizer(**kwargs)
+                    input_ids = encoded.get("input_ids") if isinstance(encoded, dict) else None
+                    if input_ids is not None:
+                        return len(input_ids)
+                except Exception:
+                    continue
+        # 测试桩或异常 tokenizer 场景下回退到字符长度，保证切片器仍可工作。
+        return len(text)
+
+    @staticmethod
+    def _offset_model_span(span: ModelSpan, offset: int) -> ModelSpan:
+        if offset == 0:
+            return span
+        return ModelSpan(
+            label=span.label,
+            text=span.text,
+            start=span.start + offset,
+            end=span.end + offset,
+            source=span.source,
+            probability=span.probability,
+        )
+
+    @staticmethod
+    def _is_ascii_alnum(char: str) -> bool:
+        return bool(char) and char.isascii() and char.isalnum()
 
     def _iter_uie_spans(
         self,

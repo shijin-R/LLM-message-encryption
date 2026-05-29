@@ -115,6 +115,71 @@ class SlowSchemaAwareUIETaskflow:
         return [result]
 
 
+class CountingTokenizer:
+    def __call__(self, text: str, **kwargs) -> dict:
+        return {"input_ids": list(range(len(text)))}
+
+
+class FakeTokenTaskInstance:
+    def __init__(
+        self,
+        max_seq_len: int = 512,
+        summary_num: int = 0,
+        summary_token_num: int = 4,
+    ) -> None:
+        self._max_seq_len = max_seq_len
+        self._tokenizer = CountingTokenizer()
+        self.summary_num = summary_num
+        self._summary_token_num = summary_token_num
+
+
+class FakeTokenTaskflow:
+    def __init__(
+        self,
+        max_seq_len: int = 512,
+        summary_num: int = 0,
+        summary_token_num: int = 4,
+    ) -> None:
+        self.task_instance = FakeTokenTaskInstance(
+            max_seq_len=max_seq_len,
+            summary_num=summary_num,
+            summary_token_num=summary_token_num,
+        )
+
+
+class FindingUIETaskflow:
+    def __init__(
+        self,
+        token_by_label: dict[str, str],
+        max_seq_len: int = 512,
+        summary_token_num: int = 4,
+    ) -> None:
+        self.token_by_label = token_by_label
+        self.task_instance = FakeTokenTaskInstance(
+            max_seq_len=max_seq_len,
+            summary_token_num=summary_token_num,
+        )
+        self.schema: list[str] = []
+        self.calls: list[str] = []
+
+    def set_schema(self, schema: list[str]) -> None:
+        self.schema = list(schema)
+
+    def __call__(self, text: str | list[str]) -> list[dict]:
+        if isinstance(text, list):
+            return [self._build_result(item) for item in text]
+        return [self._build_result(text)]
+
+    def _build_result(self, text: str) -> dict:
+        self.calls.append(text)
+        result: dict[str, list[dict]] = {}
+        for label in self.schema:
+            token = self.token_by_label.get(label)
+            if token and token in text:
+                result[label] = [{"text": token, "probability": 0.98}]
+        return result
+
+
 class EmptyModelClient:
     using_taskflow = False
     using_uie = False
@@ -222,8 +287,8 @@ class CombinedRecognizer:
         ]
 
 
-def build_mobile_only_recognizer(max_text_len: int = 512) -> ApplicationEntityRecognizer:
-    return ApplicationEntityRecognizer(EmptyModelClient(), max_text_len=max_text_len)
+def build_mobile_only_recognizer() -> ApplicationEntityRecognizer:
+    return ApplicationEntityRecognizer(EmptyModelClient())
 
 
 class DesensitizeServiceTest(unittest.TestCase):
@@ -773,6 +838,106 @@ class DesensitizeServiceTest(unittest.TestCase):
             [(("身份证号",), ("身份证号",)), (("银行卡号",), ("银行卡号",))],
         )
 
+    def test_token_chunks_batch_short_semantic_units(self) -> None:
+        recognizer = LocalEntityRecognizer.__new__(LocalEntityRecognizer)
+        taskflow = FakeTokenTaskflow(max_seq_len=64)
+        text = "one!two?three;four."
+
+        chunks = list(recognizer._iter_token_chunks(text, taskflow))
+
+        self.assertEqual(chunks, [(0, text)])
+
+    def test_semantic_units_keep_consecutive_boundaries_together(self) -> None:
+        recognizer = LocalEntityRecognizer.__new__(LocalEntityRecognizer)
+
+        units = list(recognizer._iter_semantic_units("first.\r\nsecond."))
+
+        self.assertEqual(units, [(0, "first.\r\n"), (8, "second.")])
+
+    def test_uie_chunks_ignore_compat_target_window_for_throughput(self) -> None:
+        recognizer = LocalEntityRecognizer.__new__(LocalEntityRecognizer)
+        recognizer.uie_target_text_tokens = 12
+        taskflow = FakeTokenTaskflow(max_seq_len=64)
+        text = "aaaa!bbbb!cccc!dddd!"
+
+        chunks = list(recognizer._iter_uie_token_chunks(text, taskflow, ["label"]))
+
+        self.assertEqual(chunks, [(0, text)])
+
+    def test_uie_chunks_follow_max_token_budget(self) -> None:
+        recognizer = LocalEntityRecognizer.__new__(LocalEntityRecognizer)
+        taskflow = FakeTokenTaskflow(max_seq_len=512)
+        text = (("a" * 50) + "!") * 5
+
+        chunks = list(recognizer._iter_uie_token_chunks(text, taskflow, ["label"]))
+
+        self.assertEqual(chunks, [(0, text)])
+
+    def test_token_chunks_stay_within_budget_when_batching(self) -> None:
+        recognizer = LocalEntityRecognizer.__new__(LocalEntityRecognizer)
+        taskflow = FakeTokenTaskflow(max_seq_len=13)
+        text = "aaaa!bbbb!cccc!"
+
+        chunks = list(recognizer._iter_token_chunks(text, taskflow))
+
+        self.assertEqual(chunks, [(0, "aaaa!bbbb!"), (10, "cccc!")])
+        for _, chunk in chunks:
+            self.assertLessEqual(len(chunk), 12)
+
+    def test_uie_token_chunks_reserve_prompt_budget(self) -> None:
+        recognizer = LocalEntityRecognizer.__new__(LocalEntityRecognizer)
+        taskflow = FakeTokenTaskflow(max_seq_len=20, summary_token_num=2)
+        text = "aaaaa!bbbbb!ccccc!"
+
+        chunks = list(recognizer._iter_uie_token_chunks(text, taskflow, ["label"]))
+        shared_chunks = list(
+            recognizer._iter_token_chunks(text, taskflow, prompts=["label"])
+        )
+
+        self.assertEqual(chunks, shared_chunks)
+        self.assertEqual(chunks, [(0, "aaaaa!bbbbb!"), (12, "ccccc!")])
+        for _, chunk in chunks:
+            self.assertLessEqual(len(chunk), 13)
+
+    def test_token_chunks_avoid_ascii_identifier_boundary_when_possible(self) -> None:
+        recognizer = LocalEntityRecognizer.__new__(LocalEntityRecognizer)
+        taskflow = FakeTokenTaskflow(max_seq_len=16)
+        text = "prefix 622202020202 tail;"
+
+        chunks = list(recognizer._iter_token_chunks(text, taskflow))
+
+        self.assertEqual(chunks, [(0, "prefix "), (7, "622202020202 "), (20, "tail;")])
+        for offset, chunk in chunks[:-1]:
+            end = offset + len(chunk)
+            self.assertFalse(
+                text[end - 1].isascii()
+                and text[end - 1].isalnum()
+                and text[end].isascii()
+                and text[end].isalnum()
+            )
+
+    def test_uie_chunk_spans_are_offset_to_original_text(self) -> None:
+        token = "622202020202"
+        text = f"prefix {token} tail;"
+        fake_uie = FindingUIETaskflow(
+            {"bank": token},
+            max_seq_len=22,
+            summary_token_num=1,
+        )
+        recognizer = LocalEntityRecognizer.__new__(LocalEntityRecognizer)
+        recognizer.strict_uie_model = True
+        recognizer._ensure_uie_taskflow = lambda schema: (
+            fake_uie.set_schema(schema) or fake_uie
+        )
+
+        spans = recognizer._extract_with_uie(text, ["bank"])
+
+        self.assertEqual(
+            [(span.label, span.text, span.start, span.end) for span in spans],
+            [("bank", token, text.find(token), text.find(token) + len(token))],
+        )
+        self.assertGreater(len(fake_uie.calls), 1)
+
     def test_cpu_device_uses_taskflow_cpu_id(self) -> None:
         recognizer = LocalEntityRecognizer(
             model_path=Path("resources/models/wordtag"),
@@ -932,6 +1097,8 @@ class DesensitizeServiceTest(unittest.TestCase):
         self.assertEqual(data["device"], "nvidia")
         self.assertEqual(data["device_id"], 1)
         self.assertEqual(data["taskflow_device_id"], 1)
+        self.assertEqual(data["max_model_tokens"], 512)
+        self.assertEqual(data["uie_target_text_tokens"], 512)
         self.assertTrue(data["gpu_available"])
         self.assertEqual(data["gpu_device_count"], 2)
         self.assertTrue(data["gpu_compiled_with_cuda"])
@@ -949,6 +1116,24 @@ class DesensitizeServiceTest(unittest.TestCase):
         with patch.dict(os.environ, {"DESENSITIZE_DEVICE": "amd"}):
             with self.assertRaisesRegex(ValueError, "cpu, nvidia"):
                 ServiceConfig.from_env()
+
+    def test_config_reads_token_window_settings(self) -> None:
+        config = ServiceConfig(model_path=Path("resources/models/wordtag"))
+
+        self.assertEqual(config.max_model_tokens, 512)
+        self.assertEqual(config.uie_target_text_tokens, 512)
+
+        with patch.dict(
+            os.environ,
+            {
+                "DESENSITIZE_MAX_MODEL_TOKENS": "384",
+                "DESENSITIZE_UIE_TARGET_TEXT_TOKENS": "256",
+            },
+        ):
+            config = ServiceConfig.from_env()
+
+        self.assertEqual(config.max_model_tokens, 384)
+        self.assertEqual(config.uie_target_text_tokens, 256)
 
     def test_downloaded_model_sync_is_disabled_by_default(self) -> None:
         config = ServiceConfig(model_path=Path("resources/models/wordtag"))
@@ -1017,7 +1202,7 @@ class DesensitizeServiceTest(unittest.TestCase):
             ],
         )
 
-    def test_long_builtin_text_is_chunked_before_recognition(self) -> None:
+    def test_long_builtin_text_is_recognized_without_api_chunking(self) -> None:
         self.service.recognizer = build_mobile_only_recognizer()
         text = "说明：" + ("甲" * 520) + "手机号13800138000。"
 
@@ -1030,8 +1215,8 @@ class DesensitizeServiceTest(unittest.TestCase):
         self.assertNotIn("13800138000", masked)
         self.assertEqual(result["mapping"]["MOBILE"]["13800138000"], "[[MOBILE_001]]")
 
-    def test_entity_crossing_chunk_boundary_keeps_original_coordinates(self) -> None:
-        recognizer = build_mobile_only_recognizer(max_text_len=64)
+    def test_long_text_entity_keeps_original_coordinates(self) -> None:
+        recognizer = build_mobile_only_recognizer()
         text = ("A" * 58) + "13800138000" + "完成"
 
         spans = recognizer.recognize(text, [])
@@ -1041,8 +1226,8 @@ class DesensitizeServiceTest(unittest.TestCase):
         self.assertEqual(spans[0].end, 69)
         self.assertEqual(text[spans[0].start : spans[0].end], "13800138000")
 
-    def test_overlapped_chunks_do_not_create_duplicate_mapping(self) -> None:
-        self.service.recognizer = build_mobile_only_recognizer(max_text_len=64)
+    def test_long_text_does_not_create_duplicate_mapping(self) -> None:
+        self.service.recognizer = build_mobile_only_recognizer()
         text = ("A" * 40) + "13800138000" + ("B" * 50)
 
         result = self.preprocess(
@@ -1057,7 +1242,7 @@ class DesensitizeServiceTest(unittest.TestCase):
             {"13800138000": "[[MOBILE_001]]"},
         )
 
-    def test_long_custom_uie_text_is_chunked_before_recognition(self) -> None:
+    def test_long_custom_uie_text_is_recognized_without_api_chunking(self) -> None:
         id_card = "110101199003071234"
         bank_card = "6222020202020202020"
         self.service.recognizer = ApplicationEntityRecognizer(
@@ -1153,6 +1338,47 @@ class DesensitizeServiceTest(unittest.TestCase):
                 ("BANK_CARD", "6222020202020202020", "custom"),
             ],
         )
+
+    def test_custom_uie_rejects_embedded_id_and_bank_card_fragments(self) -> None:
+        id_card = "110101199003071234"
+        bank_card = "6222020202020202020"
+        id_fragment = "10119900307123"
+        bank_fragment = "020202020202020"
+        text = f"id {id_card}; bank {bank_card}."
+        id_start = text.find(id_fragment)
+        bank_start = text.find(bank_fragment)
+        recognizer = ApplicationEntityRecognizer(
+            StaticModelClient(
+                [
+                    ModelSpan(
+                        "id",
+                        id_fragment,
+                        id_start,
+                        id_start + len(id_fragment),
+                        "uie",
+                        0.98,
+                    ),
+                    ModelSpan(
+                        "bank",
+                        bank_fragment,
+                        bank_start,
+                        bank_start + len(bank_fragment),
+                        "uie",
+                        0.97,
+                    ),
+                ]
+            )
+        )
+
+        spans = recognizer.recognize(
+            text,
+            [
+                {"entity_type": "ID_CARD", "uie_schema": ["id"]},
+                {"entity_type": "BANK_CARD", "uie_schema": ["bank"]},
+            ],
+        )
+
+        self.assertEqual(spans, [])
 
     def test_custom_uie_prefers_exact_label_when_schema_names_overlap(self) -> None:
         bank_card = "6222020202020202020"

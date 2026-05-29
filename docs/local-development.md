@@ -6,7 +6,7 @@
 
 模型服务当前使用 PaddleNLP `Taskflow("ner", entity_only=True)` 的 wordtag 模型链路，本地模型目录默认为 `resources/models/wordtag`。业务自定义实体默认启用 `Taskflow("information_extraction", model="uie-base")` 旁路，本地模型目录默认为 `resources/models/uie-base`。
 
-模型服务是纯推理层，只接收 `text` 和 `tasks`，通过内部接口 `POST /v1/infer` 返回模型原始标签片段。API 服务是应用层，负责长文本分片、手机号正则补漏、`custom_entities` 解析、历史 `mapping`、占位符、冲突消解和最终替换。
+模型服务是纯推理层，只接收 `text` 和 `tasks`，通过内部接口 `POST /v1/infer` 返回模型原始标签片段，并在模型内部按自然边界和 token 预算处理长文本；wordtag 和 UIE 共用吞吐优先的 `512` token 上限切片策略，UIE 只额外扣除 schema prompt 预算。API 服务是应用层，负责手机号正则补漏、`custom_entities` 解析、历史 `mapping`、占位符、冲突消解和最终替换。
 
 一次脱敏会合并以下实体来源：
 
@@ -69,7 +69,8 @@ python -m pip install -r requirements-api.txt
 | `DESENSITIZE_SYNC_DOWNLOADED_MODEL` | `false` | 自动下载后是否同步回本地模型目录；生产多容器默认使用各容器私有缓存 |
 | `DESENSITIZE_STRICT_LOCAL_MODEL` | `true` | wordtag 模型不可用时是否启动失败 |
 | `DESENSITIZE_STRICT_UIE_MODEL` | `false` | UIE 不可用时是否抛错 |
-| `DESENSITIZE_MAX_TEXT_LEN` | `512` | API 应用层单个识别分片最大长度；超出后会自动分片并合并识别结果 |
+| `DESENSITIZE_MAX_MODEL_TOKENS` | `512` | 模型侧最大 token 上限；wordtag 和 UIE 都不会超过该预算 |
+| `DESENSITIZE_UIE_TARGET_TEXT_TOKENS` | `512` | 兼容保留字段；吞吐优先切片不再使用 |
 | `DESENSITIZE_DEVICE` | `cpu` | 模型服务推理设备类型，首版只支持 `cpu` 或 `nvidia` |
 | `DESENSITIZE_DEVICE_ID` | `0` | NVIDIA GPU 编号；CPU 模式下会传给 PaddleNLP `-1` |
 | `DESENSITIZE_UIE_POSITION_PROB` | `0.5` | UIE 起止位置概率阈值 |

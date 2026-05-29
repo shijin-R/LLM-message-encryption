@@ -52,6 +52,8 @@ def create_model_app(
             "uie_model_name": config.uie_model_name,
             "uie_model_path": str(config.uie_model_path),
             "uie_position_prob": config.uie_position_prob,
+            "max_model_tokens": config.max_model_tokens,
+            "uie_target_text_tokens": config.uie_target_text_tokens,
             "strict_uie_model": config.strict_uie_model,
             "uie_model_cache_path": str(config.downloaded_uie_model_cache_path),
             "using_uie": recognizer.using_uie,

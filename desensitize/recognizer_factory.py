@@ -24,6 +24,8 @@ def build_model_recognizer(config: ServiceConfig) -> Any:
         uie_model_name=config.uie_model_name,
         uie_model_path=config.uie_model_path,
         uie_position_prob=config.uie_position_prob,
+        max_model_tokens=config.max_model_tokens,
+        uie_target_text_tokens=config.uie_target_text_tokens,
         strict_uie_model=config.strict_uie_model,
         downloaded_uie_model_cache_path=config.downloaded_uie_model_cache_path,
     )
@@ -35,7 +37,4 @@ def build_api_recognizer(config: ServiceConfig):
         base_url=config.model_service_url,
         timeout=config.model_service_timeout,
     )
-    return ApplicationEntityRecognizer(
-        model_client=model_client,
-        max_text_len=config.max_text_len,
-    )
+    return ApplicationEntityRecognizer(model_client=model_client)

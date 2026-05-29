@@ -15,10 +15,6 @@ from .types import EntitySpan, ModelSpan
 class ApplicationEntityRecognizer:
     """把纯模型推理结果编排成脱敏业务实体。"""
 
-    DEFAULT_MAX_TEXT_LEN = 512
-    CHUNK_OVERLAP = 128
-    CHUNK_BOUNDARY_CHARS = "\r\n。！？!?；;，,、：: \t"
-
     MOBILE_PATTERN = re.compile(r"(?<!\d)1[3-9]\d{9}(?!\d)")
     CHINESE_PATTERN = re.compile(r"[\u4e00-\u9fff]")
 
@@ -43,9 +39,8 @@ class ApplicationEntityRecognizer:
         "户籍地址",
     }
 
-    def __init__(self, model_client: Any, max_text_len: int = DEFAULT_MAX_TEXT_LEN):
+    def __init__(self, model_client: Any):
         self.model_client = model_client
-        self.max_text_len = max(1, int(max_text_len))
 
     @property
     def using_taskflow(self) -> bool:
@@ -77,7 +72,7 @@ class ApplicationEntityRecognizer:
 
         uie_rules, uie_schema = self._parse_custom_uie_rules(custom_entities)
         spans: list[EntitySpan] = []
-        for model_span in self._infer_chunks(text, wordtag=True, uie_schema=uie_schema):
+        for model_span in self._infer_model_spans(text, wordtag=True, uie_schema=uie_schema):
             entity_span = self._model_span_to_entity(text, model_span, uie_rules)
             if entity_span is not None:
                 spans.append(entity_span)
@@ -86,32 +81,24 @@ class ApplicationEntityRecognizer:
         spans = self._merge_adjacent_custom_spans(spans, text)
         return self._deduplicate_spans(spans, text)
 
-    def _infer_chunks(
+    def _infer_model_spans(
         self,
         text: str,
         wordtag: bool,
         uie_schema: list[str],
     ) -> Iterator[ModelSpan]:
-        # 这里只切分“识别输入”，不拆业务消息；返回 span 时统一回填到全文坐标。
-        for offset, chunk in self._iter_text_chunks(text):
-            spans = self.model_client.infer(
-                chunk,
-                {
-                    "wordtag": wordtag,
-                    "uie_schema": uie_schema,
-                },
-            )
-            for span in spans:
-                if span.start < 0 or span.end > len(chunk) or span.start >= span.end:
-                    continue
-                yield ModelSpan(
-                    label=span.label,
-                    text=span.text,
-                    start=span.start + offset,
-                    end=span.end + offset,
-                    source=span.source,
-                    probability=span.probability,
-                )
+        """API 层只编排结果；长文本切片统一交给模型服务内部处理。"""
+        spans = self.model_client.infer(
+            text,
+            {
+                "wordtag": wordtag,
+                "uie_schema": uie_schema,
+            },
+        )
+        for span in spans:
+            if span.start < 0 or span.end > len(text) or span.start >= span.end:
+                continue
+            yield span
 
     def _model_span_to_entity(
         self,
@@ -148,44 +135,9 @@ class ApplicationEntityRecognizer:
         real_text = text[span.start : span.end]
         if not self._looks_valid_entity(entity_type, real_text):
             return None
+        if not self._has_valid_entity_boundary(entity_type, text, span.start, span.end):
+            return None
         return EntitySpan(entity_type, real_text, span.start, span.end, "custom")
-
-    def _iter_text_chunks(self, text: str) -> Iterator[tuple[int, str]]:
-        """按配置长度切分文本，分片之间保留重叠区避免边界漏识别。"""
-        if len(text) <= self.max_text_len:
-            yield 0, text
-            return
-
-        start = 0
-        text_len = len(text)
-        while start < text_len:
-            hard_end = min(start + self.max_text_len, text_len)
-            end = self._find_chunk_end(text, start, hard_end)
-            if end <= start:
-                end = hard_end
-
-            yield start, text[start:end]
-
-            if end >= text_len:
-                break
-
-            overlap = min(self.CHUNK_OVERLAP, self.max_text_len // 2, end - start - 1)
-            next_start = end - max(0, overlap)
-            if next_start <= start:
-                next_start = end
-            start = next_start
-
-    def _find_chunk_end(self, text: str, start: int, hard_end: int) -> int:
-        """优先在靠近分片末尾的自然边界断开，找不到时使用硬切点。"""
-        if hard_end >= len(text):
-            return hard_end
-
-        search_window = min(self.CHUNK_OVERLAP, (hard_end - start) // 2)
-        search_start = max(start + 1, hard_end - search_window)
-        for index in range(hard_end - 1, search_start - 1, -1):
-            if text[index] in self.CHUNK_BOUNDARY_CHARS:
-                return index + 1
-        return hard_end
 
     def _extract_mobile(self, text: str) -> list[EntitySpan]:
         spans: list[EntitySpan] = []
@@ -330,6 +282,28 @@ class ApplicationEntityRecognizer:
         if re.search(r"\d", text):
             return True
         return bool(re.search(r"[省市区县镇乡村街路巷道号楼室园场站口]", text))
+
+    @classmethod
+    def _has_valid_entity_boundary(
+        cls,
+        entity_type: str,
+        text: str,
+        start: int,
+        end: int,
+    ) -> bool:
+        normalized_type = normalize_entity_type(entity_type)
+        if normalized_type not in {"BANK_CARD", "ID_CARD"}:
+            return True
+        # 这里只做边界校验，过滤模型在长数字/字母串中误返回的半截实体，不新增规则识别。
+        if start > 0 and cls._is_ascii_alnum(text[start - 1]):
+            return False
+        if end < len(text) and cls._is_ascii_alnum(text[end]):
+            return False
+        return True
+
+    @staticmethod
+    def _is_ascii_alnum(char: str) -> bool:
+        return bool(char) and char.isascii() and char.isalnum()
 
     def _merge_adjacent_custom_spans(
         self,
