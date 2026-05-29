@@ -100,7 +100,6 @@ class LocalEntityRecognizer:
         self._uie_schema: tuple[str, ...] = ()
         self._taskflow_lock = threading.RLock()
         self._uie_lock = threading.RLock()
-        self._infer_lock = threading.RLock()
 
         self._taskflow = self._build_taskflow()
 
@@ -533,15 +532,10 @@ class LocalEntityRecognizer:
         uie_schema = self._normalize_uie_schema(normalized_tasks.get("uie_schema"))
 
         spans: list[ModelSpan] = []
-        # PaddleNLP Taskflow/predictor instances are process-local mutable objects.
-        # Serializing the model path avoids intermittent failures when wordtag and UIE
-        # enter the underlying runtime at the same time.
-        lock = getattr(self, "_infer_lock", nullcontext())
-        with lock:
-            if run_wordtag:
-                spans.extend(self.infer_wordtag(text))
-            if uie_schema:
-                spans.extend(self.infer_uie(text, uie_schema))
+        if run_wordtag:
+            spans.extend(self.infer_wordtag(text))
+        if uie_schema:
+            spans.extend(self.infer_uie(text, uie_schema))
 
         return self._deduplicate_model_spans(spans, text)
 
