@@ -45,6 +45,15 @@ RUN sed -i 's#http://archive.ubuntu.com/ubuntu#http://mirrors.tuna.tsinghua.edu.
     && chown -R app:app /app \
     && rm -rf /var/lib/apt/lists/*
 
+RUN set -eux; \
+    for lib_dir in /usr/lib/x86_64-linux-gnu /usr/local/cuda/lib64; do \
+        [ -d "$lib_dir" ] || continue; \
+        if [ -e "$lib_dir/libcudnn.so.8" ]; then ln -sf "$lib_dir/libcudnn.so.8" "$lib_dir/libcudnn.so"; fi; \
+        if [ -e "$lib_dir/libcublas.so.11" ]; then ln -sf "$lib_dir/libcublas.so.11" "$lib_dir/libcublas.so"; fi; \
+        if [ -e "$lib_dir/libcublasLt.so.11" ]; then ln -sf "$lib_dir/libcublasLt.so.11" "$lib_dir/libcublasLt.so"; fi; \
+    done; \
+    ldconfig
+
 COPY requirements-api.txt requirements-model.txt ./
 RUN python -m pip install --upgrade pip setuptools wheel \
     -i https://pypi.tuna.tsinghua.edu.cn/simple \
